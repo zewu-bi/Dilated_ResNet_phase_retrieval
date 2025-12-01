@@ -1,4 +1,4 @@
-Dilated ResNet Phase Retrieval
+# Dilated ResNet Phase Retrieval
 
 1D Dilated ResNet for Coherent Transition Radiation (CTR) Phase Retrieval
 From form factor → longitudinal beam profile using a physics-informed deep neural network.
@@ -10,31 +10,32 @@ The project is designed for high-resolution (1024-point) spectra, two-Gaussian (
 ✨ Features
 
 Physics-informed data generation
-
 Multi-Gaussian electron beams
-
 Log-uniform charge ratio sampling
-
-Optional log-uniform sigma / peak distance sampling
-
-Form factor calculation
-
-Fourier-based analytical calculation
-
-Supports noisy spectrum for robustness training
-
-Dilated ResNet
-
-1D CNN with exponentially increasing receptive field
-
+Fourier-based analytical form factor calculation
+Dilated ResNet with exponentially increasing receptive field
 Residual blocks
-
 Suitable for band-limited, global-dependency inverse problems
-
 Training & evaluation pipeline
-
 GPU-accelerated training
-
-Automatic saving of best checkpoints
-
 Experiment logs & visualization
+
+📂 Directory Structure
+
+project_root/
+│
+├── beam_profile_library/           # Library of ground-truth electron bunches
+├── calculated_form_factor/         # Precomputed form factors (FFT or analytical)
+├── dataset/                        # Final paired dataset: (form_factor, beam_profile)
+├── generated_beam_profile/         # Synthetic beam profiles from generator
+├── logs/                           # TensorBoard logs, training curves
+├── model/                          # Saved models (best checkpoints)
+│
+├── 1D_Dilated_ResNet.ipynb         # Model definition, trainting and testing
+├── beam_generator.ipynb            # G2 beam generator (charge ratio, sigma, distance)
+├── form_factor_calculator.ipynb    # FFT-based (or analytical) |F(ω)|² computation
+├── experiment_logs.ipynb           
+│
+└── README.md
+
+
