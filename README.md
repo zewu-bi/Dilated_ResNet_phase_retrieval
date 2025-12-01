@@ -1,5 +1,3 @@
-# Dilated ResNet Phase Retrieval
-
 # 1D Dilated ResNet for Coherent Transition Radiation (CTR) Phase Retrieval
 
 From form factor → longitudinal beam profile using a physics-informed deep neural network.
