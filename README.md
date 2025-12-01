@@ -8,16 +8,16 @@ The project is designed for high-resolution (1024-point) spectra, two-Gaussian (
 
 ✨ Features
 
-Physics-informed data generation
-Multi-Gaussian electron beams
-Log-uniform charge ratio sampling
-Fourier-based analytical form factor calculation
-Dilated ResNet with exponentially increasing receptive field
-Residual blocks
-Suitable for band-limited, global-dependency inverse problems
-Training & evaluation pipeline
-GPU-accelerated training
-Experiment logs & visualization
+Physics-informed data generation;
+Multi-Gaussian electron beams;
+Log-uniform charge ratio sampling;
+Fourier-based analytical form factor calculation;
+Dilated ResNet with exponentially increasing receptive field;
+Residual blocks;
+Suitable for band-limited, global-dependency inverse problems;
+Training & evaluation pipeline;
+GPU-accelerated training;
+Experiment logs & visualization;
 
 📂 Directory Structure
 
