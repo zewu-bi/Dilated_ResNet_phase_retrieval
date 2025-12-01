@@ -10,3 +10,5 @@
 | 6 | G2R_100_800_1_5_20_40_1_3_10000 | 256 | Dilated ResNet | 6 | 1e-3 | 200 | Good generalization for large height differences; poor for width variations. |
 | 7 | G2RR_100_800_1_5_20_40_1_3_03_3_10000 | 256 | Dilated ResNet | 6 | 1e-3 | 600 | sigma_ratio is physically unrealistic; overall training worse than Exp 6; extreme sigma distributions generalize poorly. |
 | 8 | G2RP_100_800_2_5_1_3_20_40_05_3_30000 | 256 | Dilated ResNet | 6 | 1e-3 | 200 | Q_ratio + sigma_prior + 30000 samples; rare-case generalization still unsatisfactory. |
+| 9 | G2RP_100_800_2_5_1_3_20_40_05_3_100000 | 256 | Dilated ResNet | 6 | 1e-3 | 200 | Read.csv too slow; change to .pt dataset. |
+| 10 | G2RP_pt_100_800_2_5_1_3_20_40_05_3_100000 | 256 | Dilated ResNet | 6 | 1e-3 | 200 | Use cache dataloader skills; Smoothness learned  |
