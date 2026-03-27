@@ -3,6 +3,8 @@ from __future__ import annotations
 import io
 import __main__
 import os
+import sys
+import types
 from functools import lru_cache
 from typing import Tuple
 
@@ -67,9 +69,17 @@ class Dilated_CNN_ResNet(nn.Module):
         return self.out_conv(x)
 
 
-# Your .pth was saved from a notebook __main__ context.
+# Compatibility for checkpoints saved from notebook __main__ context.
 setattr(__main__, "DilatedResBlock", DilatedResBlock)
 setattr(__main__, "Dilated_CNN_ResNet", Dilated_CNN_ResNet)
+
+# Compatibility for older checkpoints saved from src.dilated_resnet.
+src_pkg = sys.modules.setdefault("src", types.ModuleType("src"))
+compat_mod = types.ModuleType("src.dilated_resnet")
+compat_mod.DilatedResBlock = DilatedResBlock
+compat_mod.Dilated_CNN_ResNet = Dilated_CNN_ResNet
+sys.modules["src.dilated_resnet"] = compat_mod
+setattr(src_pkg, "dilated_resnet", compat_mod)
 
 
 @lru_cache(maxsize=1)
@@ -82,8 +92,9 @@ def load_model() -> nn.Module:
     if isinstance(loaded, nn.Module):
         model = loaded
     elif isinstance(loaded, dict):
+        state_dict = loaded.get("model_state_dict") or loaded.get("state_dict") or loaded
         model = Dilated_CNN_ResNet(in_ch=1, base_ch=64)
-        model.load_state_dict(loaded)
+        model.load_state_dict(state_dict)
     else:
         raise RuntimeError(f"Unsupported model payload type: {type(loaded)}")
 
