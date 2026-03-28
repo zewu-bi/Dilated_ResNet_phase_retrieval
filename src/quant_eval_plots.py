@@ -7,6 +7,7 @@ from collections import defaultdict
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+from matplotlib.colors import TwoSlopeNorm
 from matplotlib.patches import Patch
 
 from src.prab_plot_style import PRAB_COLORS, setup_prab_style
@@ -182,6 +183,16 @@ def _maybe_pair_from_meta(sample_meta, candidate_keys):
     return None
 
 
+def _weighted_sigma(z, y):
+    y = np.clip(np.asarray(y, dtype=float), 0, None)
+    s = y.sum()
+    if s <= 0:
+        return np.nan
+    mu = float((z * y).sum() / s)
+    var = float(((z - mu) ** 2 * y).sum() / s)
+    return np.sqrt(max(var, 0.0))
+
+
 def estimate_double_parameters(sample_meta, target, z_centered, dx_um):
     charges = _maybe_pair_from_meta(
         sample_meta,
@@ -223,7 +234,44 @@ def estimate_double_parameters(sample_meta, target, z_centered, dx_um):
     return separation, q_ratio
 
 
-def _grouped_boxplot(ax, data_by_key, groups, methods, ylabel, title, xticklabels, colors, show_legend=False):
+
+def estimate_double_sigmas(sample_meta, target, z_centered, dx_um):
+    centers = _maybe_pair_from_meta(
+        sample_meta,
+        ["centers", "means", "mus", "mu_list", "positions", "pos", "x0", "centroids"],
+    )
+    sigmas = _maybe_pair_from_meta(
+        sample_meta,
+        ["sigmas", "sigma_list", "widths", "width_list", "stds", "std_list", "sigma"],
+    )
+
+    if sigmas is not None and centers is not None:
+        order = np.argsort(np.asarray(centers, dtype=float))
+        sigmas = np.asarray(sigmas, dtype=float)[order]
+        return float(sigmas[0]), float(sigmas[1])
+    if sigmas is not None:
+        sigmas = np.asarray(sigmas, dtype=float)
+        return float(sigmas[0]), float(sigmas[1])
+
+    y = l1_nonneg_normalize(target)
+    peaks = _find_two_peak_indices(y, dx_um=dx_um, min_sep_um=2.0, min_height_rel=0.10)
+    if len(peaks) < 2:
+        return np.nan, np.nan
+
+    valley_rel = np.argmin(y[peaks[0]: peaks[1] + 1])
+    valley = int(peaks[0] + valley_rel)
+
+    left_mask = np.zeros_like(y, dtype=bool)
+    right_mask = np.zeros_like(y, dtype=bool)
+    left_mask[: valley + 1] = True
+    right_mask[valley + 1:] = True
+
+    sigma_left = _weighted_sigma(z_centered[left_mask], y[left_mask])
+    sigma_right = _weighted_sigma(z_centered[right_mask], y[right_mask])
+    return float(sigma_left), float(sigma_right)
+
+
+def _grouped_boxplot(ax, data_by_key, groups, methods, ylabel, title, xticklabels, colors, show_legend=False, legend_loc="upper right"):
     positions, data, facecolors = [], [], []
     base_positions = np.arange(len(groups)) * 3.0
     offsets = np.linspace(-0.45, 0.45, len(methods))
@@ -267,7 +315,7 @@ def _grouped_boxplot(ax, data_by_key, groups, methods, ylabel, title, xticklabel
 
     if show_legend:
         handles = [Patch(facecolor=colors[m], edgecolor="black", alpha=0.65, label=m) for m in methods]
-        ax.legend(handles=handles, loc="best")
+        ax.legend(handles=handles, loc=legend_loc)
 
 
 def _select_random_local_indices(
@@ -551,8 +599,10 @@ def build_quantitative_cache(
                 }
 
         separation, q_ratio = (np.nan, np.nan)
+        sigma_left, sigma_right = (np.nan, np.nan)
         if group == "Double":
             separation, q_ratio = estimate_double_parameters(sample_meta, tgt_np, z_centered, dx_um)
+            sigma_left, sigma_right = estimate_double_sigmas(sample_meta, tgt_np, z_centered, dx_um)
 
         record = {
             "local_idx": int(local_idx),
@@ -576,6 +626,8 @@ def build_quantitative_cache(
             "measured_band": measured_band,
             "separation_um": separation,
             "q_ratio": q_ratio,
+            "sigma_left_um": sigma_left,
+            "sigma_right_um": sigma_right,
             "selected_for_vis": local_idx in vis_set,
             "dense_gs_preds": dense_gs_preds,
             "dense_gs_quantiles": dense_q,
@@ -583,11 +635,11 @@ def build_quantitative_cache(
         }
         sample_records[int(local_idx)] = record
 
-        if group == "Double" and np.isfinite(separation) and np.isfinite(q_ratio) and np.isfinite(gs_profile_median):
+        if group == "Double" and np.isfinite(sigma_left) and np.isfinite(sigma_right) and np.isfinite(gs_profile_median):
             double_advantage_records.append({
                 "local_idx": int(local_idx),
-                "separation_um": float(separation),
-                "q_ratio": float(q_ratio),
+                "sigma_left_um": float(sigma_left),
+                "sigma_right_um": float(sigma_right),
                 "nn_error": float(nn_profile_err),
                 "gs_error": float(gs_profile_median),
                 "advantage": float(gs_profile_median - nn_profile_err),
@@ -646,19 +698,33 @@ def build_quantitative_cache(
             "sample_seed": int(sample_seed),
             "dense_vis_seed_count": int(dense_vis_seed_count),
             "double_heatmap_definition": {
-                "x": "Peak separation (μm)",
-                "y": "Charge ratio = max(Q1, Q2) / min(Q1, Q2)",
+                "x": "Left-bunch effective sigma (μm)",
+                "y": "Right-bunch effective sigma (μm)",
                 "score": "GS median profile NRMSE - NN profile NRMSE; positive means NN is better",
             },
         },
     }
 
 
-def plot_representative_examples(cache, example_idx=None, figsize=(7.2, 4.6)):
+def plot_representative_examples(
+    cache,
+    example_idx=None,
+    figsize=(7.2, 4.6),
+    title=None,
+    xlabel="z (μm)",
+    ylabel=r"L1-normalized $\rho(z)$",
+    target_label="Target",
+    nn_label=None,
+    gs_label=None,
+    legend_loc="upper right",
+):
     setup_prab_style()
     cfg = cache["config"]
     model_name = cfg["model_name"]
     sample_records = cache.get("sample_records", {})
+
+    if nn_label is None:
+        nn_label = model_name
 
     if example_idx is None:
         vis_list = cfg.get("vis_indices", ())
@@ -681,22 +747,26 @@ def plot_representative_examples(cache, example_idx=None, figsize=(7.2, 4.6)):
     z_um = (np.arange(N) - N // 2) * cfg["dx_um"]
 
     fig, ax = plt.subplots(1, 1, figsize=figsize)
-    ax.plot(z_um, target, color=COLORS["target"], label="Target")
-    ax.plot(z_um, pred_nn, "--", color=COLORS[METHOD_NN], label=model_name)
+    ax.plot(z_um, target, color=COLORS["target"], label=target_label)
+    ax.plot(z_um, pred_nn, "--", color=COLORS[METHOD_NN], label=nn_label)
 
     dense_q = ex.get("dense_gs_quantiles", None)
     if dense_q is not None:
+        if gs_label is None:
+            gs_label = f"GS envelope (5–95%, {ex['dense_vis_seed_count']} seeds)"
         ax.fill_between(
             z_um,
             dense_q["q05"],
             dense_q["q95"],
             color=COLORS[METHOD_GS],
             alpha=0.18,
-            label=f"GS envelope (5–95%, {ex['dense_vis_seed_count']} seeds)",
+            label=gs_label,
         )
     else:
         gs_preds = ex.get("gs_preds", [])
         if len(gs_preds) > 0:
+            if gs_label is None:
+                gs_label = f"GS envelope ({len(gs_preds)} seeds)"
             gs_stack = np.vstack(gs_preds)
             ax.fill_between(
                 z_um,
@@ -704,19 +774,28 @@ def plot_representative_examples(cache, example_idx=None, figsize=(7.2, 4.6)):
                 np.max(gs_stack, axis=0),
                 color=COLORS[METHOD_GS],
                 alpha=0.18,
-                label=f"GS envelope ({len(gs_preds)} seeds)",
+                label=gs_label,
             )
 
-    ax.set_xlabel("z (μm)")
-    ax.set_ylabel(r"L1-normalized $\rho(z)$")
-    ax.set_title(f"Validation sample {ex['local_idx']} ({ex['group']})")
+    if title is None:
+        title = f"Validation sample {ex['local_idx']} ({ex['group']})"
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
     ax.grid(True)
-    ax.legend(loc="best")
+    ax.legend(loc=legend_loc)
     fig.tight_layout()
     return fig, ax
 
 
-def plot_panel_a(cache, figsize=(7.2, 5.1)):
+def plot_panel_a(
+    cache,
+    figsize=(7.2, 5.1),
+    title="(a) Profile reconstruction error",
+    ylabel="Profile NRMSE",
+    xticklabels=("Single", "Double"),
+    legend_loc="upper right",
+):
     setup_prab_style()
     fig, ax = plt.subplots(1, 1, figsize=figsize)
     model_name = cache["config"]["model_name"]
@@ -725,11 +804,12 @@ def plot_panel_a(cache, figsize=(7.2, 5.1)):
         cache["metrics"]["profile_nrmse"],
         groups=GROUP_ORDER,
         methods=[model_name, METHOD_GS],
-        ylabel="Profile NRMSE",
-        title="(a) Profile reconstruction error",
-        xticklabels=["Single", "Double"],
+        ylabel=ylabel,
+        title=title,
+        xticklabels=list(xticklabels),
         colors={model_name: COLORS[METHOD_NN], METHOD_GS: COLORS[METHOD_GS]},
         show_legend=True,
+        legend_loc=legend_loc,
     )
     fig.tight_layout()
     return fig, ax
@@ -757,7 +837,15 @@ def _method_boxplot(ax, values_method_1, values_method_2, positions, colors, wid
     return bp
 
 
-def plot_panel_bc_double(cache, figsize=(8.8, 5.0)):
+def plot_panel_bc_double(
+    cache,
+    figsize=(8.8, 5.0),
+    title="Double-bunch spectral and separation errors",
+    left_ylabel=r"$\|F_{\mathrm{rec}}-F_{\mathrm{meas}}\|_2 / \|F_{\mathrm{meas}}\|_2$",
+    right_ylabel=r"$|\Delta \mathrm{separation}|$ (μm)",
+    xticklabels=("Spectral mismatch", "Peak-separation error"),
+    legend_loc="upper right",
+):
     setup_prab_style()
     model_name = cache["config"]["model_name"]
 
@@ -786,17 +874,17 @@ def plot_panel_bc_double(cache, figsize=(8.8, 5.0)):
 
     ax_left.set_xlim(0.45, 2.55)
     ax_left.set_xticks([1.0, 2.0])
-    ax_left.set_xticklabels(["Spectral mismatch", "Peak-separation error"])
-    ax_left.set_ylabel(r"$\|F_{\mathrm{rec}}-F_{\mathrm{meas}}\|_2 / \|F_{\mathrm{meas}}\|_2$")
-    ax_right.set_ylabel(r"$|\Delta \mathrm{separation}|$ (μm)")
-    ax_left.set_title("Double-bunch spectral and separation errors")
+    ax_left.set_xticklabels(list(xticklabels))
+    ax_left.set_ylabel(left_ylabel)
+    ax_right.set_ylabel(right_ylabel)
+    ax_left.set_title(title)
     ax_left.grid(axis="y")
 
     handles = [
         Patch(facecolor=COLORS[METHOD_NN], edgecolor="black", alpha=0.65, label=model_name),
         Patch(facecolor=COLORS[METHOD_GS], edgecolor="black", alpha=0.65, label=METHOD_GS),
     ]
-    ax_left.legend(handles=handles, loc="upper left")
+    ax_left.legend(handles=handles, loc=legend_loc)
     fig.tight_layout()
     return fig, (ax_left, ax_right)
 
@@ -824,14 +912,18 @@ def plot_double_advantage_heatmap(
     x_bins=10,
     y_bins=10,
     min_count_per_bin=3,
-    x_range=(10.0, 20.0),
-    y_range=(1.0, 5.0),
+    x_range=None,
+    y_range=None,
+    title="Double-bunch advantage map (positive: dilated ResNet better)",
+    xlabel=r"Left-bunch effective $\sigma$ (μm)",
+    ylabel=r"Right-bunch effective $\sigma$ (μm)",
+    cbar_label=r"$\Delta$accuracy = NRMSE$_{GS,med}$ - NRMSE$_{NN}$",
 ):
     setup_prab_style()
     records = cache.get("double_advantage_records", [])
 
-    xs = np.array([r["separation_um"] for r in records], dtype=float)
-    ys = np.array([r["q_ratio"] for r in records], dtype=float)
+    xs = np.array([r["sigma_left_um"] for r in records], dtype=float)
+    ys = np.array([r["sigma_right_um"] for r in records], dtype=float)
     scores = np.array([r["advantage"] for r in records], dtype=float)
 
     finite = np.isfinite(xs) & np.isfinite(ys) & np.isfinite(scores)
@@ -844,7 +936,14 @@ def plot_double_advantage_heatmap(
         ax.text(0.5, 0.5, "No finite double-bunch heatmap data available", ha="center", va="center", transform=ax.transAxes)
         ax.set_axis_off()
         fig.tight_layout()
-        return fig, ax
+        return fig, ax, None
+
+    if x_range is None:
+        x_pad = 0.05 * max(xs.max() - xs.min(), 1e-6)
+        x_range = (xs.min() - x_pad, xs.max() + x_pad)
+    if y_range is None:
+        y_pad = 0.05 * max(ys.max() - ys.min(), 1e-6)
+        y_range = (ys.min() - y_pad, ys.max() + y_pad)
 
     keep = (
         (xs >= x_range[0]) & (xs <= x_range[1]) &
@@ -864,19 +963,24 @@ def plot_double_advantage_heatmap(
         mean_grid = sum_grid / cnt_grid
     mean_grid[cnt_grid < int(min_count_per_bin)] = np.nan
 
-    mesh = ax.pcolormesh(x_edges, y_edges, mean_grid.T, shading="auto", cmap="coolwarm")
+    finite_grid = mean_grid[np.isfinite(mean_grid)]
+    vmax = float(np.max(np.abs(finite_grid))) if finite_grid.size else 1.0
+    vmax = max(vmax, 1e-12)
+    norm = TwoSlopeNorm(vmin=-vmax, vcenter=0.0, vmax=vmax)
+
+    mesh = ax.pcolormesh(x_edges, y_edges, mean_grid.T, shading="auto", cmap="bwr", norm=norm)
     cbar = fig.colorbar(mesh, ax=ax)
-    cbar.set_label(r"$\Delta$accuracy = NRMSE$_{GS,med}$ - NRMSE$_{NN}$")
+    cbar.set_label(cbar_label)
 
     ax.set_xlim(*x_range)
     ax.set_ylim(*y_range)
-    ax.set_xlabel("Peak separation (μm)")
-    ax.set_ylabel(r"$q_{\mathrm{ratio}} = \max(Q_1,Q_2)/\min(Q_1,Q_2)$")
-    ax.set_title("Double-bunch advantage map (positive: dilated ResNet better)")
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
     ax.grid(False)
 
     fig.tight_layout()
-    return fig, ax
+    return fig, ax, cbar
 
 
 def print_cache_summary(cache):
