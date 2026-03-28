@@ -56,6 +56,12 @@ def _finite_array(x):
     return x[np.isfinite(x)]
 
 
+def _safe_global_idx(val_dataset, local_idx):
+    if hasattr(val_dataset, "indices"):
+        return int(val_dataset.indices[local_idx])
+    return int(local_idx)
+
+
 def l1_nonneg_normalize(y):
     y = np.clip(_to_np(y), 0, None).astype(np.float64)
     s = y.sum()
@@ -182,6 +188,42 @@ def make_support_mask(N, dx_um, width_um, device):
     return torch.tensor(mask_np, dtype=torch.float32, device=device)
 
 
+def single_shape_complexity(y, z):
+    """
+    Complexity = L1 distance to a moment-matched Gaussian.
+    0 means exactly Gaussian; larger values mean further away from Gaussian.
+    """
+    y = l1_nonneg_normalize(y)
+    z = _to_np(z).astype(np.float64)
+    total = y.sum()
+    if total <= 0:
+        return np.nan
+
+    mu = float(np.sum(z * y))
+    var = float(np.sum(((z - mu) ** 2) * y))
+    sigma = np.sqrt(max(var, 1e-12))
+
+    g = np.exp(-0.5 * ((z - mu) / sigma) ** 2)
+    g = l1_nonneg_normalize(g)
+    return 0.5 * float(np.sum(np.abs(y - g)))
+
+
+def single_left_right_charge_ratio(y, z, split_center=None):
+    """
+    Charge ratio for single-bunch map:
+    Q_ratio = max(Q_left, Q_right) / min(Q_left, Q_right).
+    Symmetric bunch -> ratio close to 1.
+    """
+    y = l1_nonneg_normalize(y)
+    z = _to_np(z).astype(np.float64)
+    if split_center is None:
+        split_center = float(np.sum(z * y))
+    left = float(y[z < split_center].sum())
+    right = float(y[z >= split_center].sum())
+    denom = max(min(left, right), 1e-12)
+    return max(left, right) / denom
+
+
 def _grouped_boxplot(ax, data_by_key, groups, methods, ylabel, title, xticklabels, colors, show_legend=False):
     positions, data, facecolors = [], [], []
     base_positions = np.arange(len(groups)) * 3.0
@@ -201,7 +243,6 @@ def _grouped_boxplot(ax, data_by_key, groups, methods, ylabel, title, xticklabel
         ax.set_yticks([])
         return
 
-    # matplotlib boxplot cannot handle empty arrays reliably; replace empty ones with [nan]
     safe_data = [v if len(v) > 0 else np.array([np.nan]) for v in data]
 
     bp = ax.boxplot(
@@ -231,6 +272,54 @@ def _grouped_boxplot(ax, data_by_key, groups, methods, ylabel, title, xticklabel
         ax.legend(handles=handles, loc="best")
 
 
+def _select_random_local_indices(
+    val_dataset,
+    tgt_files,
+    target_folder,
+    vis_indices,
+    n_random_samples,
+    sample_seed,
+):
+    valid_local_indices = []
+    group_by_local = {}
+    global_by_local = {}
+
+    for local_idx in range(len(val_dataset)):
+        global_idx = _safe_global_idx(val_dataset, local_idx)
+        fname = tgt_files[global_idx]
+        meta = torch.load(os.path.join(target_folder, fname), map_location="cpu", weights_only=False)
+        group = infer_group(meta, fname)
+        if group in ("Single", "Double"):
+            valid_local_indices.append(local_idx)
+            group_by_local[local_idx] = group
+            global_by_local[local_idx] = global_idx
+
+    vis_indices = tuple(vis_indices)
+    forced = [idx for idx in vis_indices if idx in group_by_local]
+    if n_random_samples is None:
+        selected = list(valid_local_indices)
+    else:
+        n_random_samples = min(int(n_random_samples), len(valid_local_indices))
+        remaining_pool = [idx for idx in valid_local_indices if idx not in set(forced)]
+        n_extra = max(0, n_random_samples - len(forced))
+        rng = np.random.default_rng(int(sample_seed))
+        extra = rng.choice(remaining_pool, size=n_extra, replace=False).tolist() if n_extra > 0 else []
+        selected = forced + extra
+
+    selected = sorted(set(selected))
+    selected_by_group = defaultdict(list)
+    for idx in selected:
+        selected_by_group[group_by_local[idx]].append(idx)
+
+    return {
+        "all": selected,
+        "by_group": dict(selected_by_group),
+        "group_by_local": group_by_local,
+        "global_by_local": global_by_local,
+        "forced_vis_indices": tuple(forced),
+    }
+
+
 def build_quantitative_cache(
     model,
     val_dataset,
@@ -248,8 +337,10 @@ def build_quantitative_cache(
     gerchberg_saxton_1d_torch,
     fwhm_center,
     align_by_fwhm,
-    max_per_group=500,
-    gs_seeds=(0, 1, 2, 3, 4),
+    max_per_group=None,
+    n_random_samples=1000,
+    sample_seed=0,
+    gs_seeds=(0, 1, 2),
     gs_iters=2000,
     use_support=True,
     support_width_um=30.0,
@@ -259,13 +350,17 @@ def build_quantitative_cache(
     setup_prab_style()
     model.eval()
 
-    selected_indices = defaultdict(list)
-    for local_idx, global_idx in enumerate(val_dataset.indices):
-        fname = tgt_files[global_idx]
-        meta = torch.load(os.path.join(target_folder, fname), map_location="cpu", weights_only=False)
-        group = infer_group(meta, fname)
-        if group in ("Single", "Double") and len(selected_indices[group]) < max_per_group:
-            selected_indices[group].append(local_idx)
+    selection = _select_random_local_indices(
+        val_dataset=val_dataset,
+        tgt_files=tgt_files,
+        target_folder=target_folder,
+        vis_indices=vis_indices,
+        n_random_samples=n_random_samples,
+        sample_seed=sample_seed,
+    )
+    selected_local_indices = selection["all"]
+    group_by_local = selection["group_by_local"]
+    global_by_local = selection["global_by_local"]
 
     metrics = {
         "profile_nrmse": defaultdict(list),
@@ -274,8 +369,9 @@ def build_quantitative_cache(
     }
     gs_seed_spread = defaultdict(list)
     timing = {model_name: [], METHOD_GS: []}
-    example_bank = []
-    examples = []
+    sample_records = {}
+    single_advantage_records = []
+
     vis_indices = tuple(vis_indices)
     vis_set = set(vis_indices)
 
@@ -290,128 +386,164 @@ def build_quantitative_cache(
         t1 = time.perf_counter()
         return pred, (t1 - t0) * 1000.0
 
-    for group in GROUP_ORDER:
-        for local_idx in selected_indices[group]:
-            img, tgt = val_dataset[local_idx]
-            img = img.unsqueeze(0).to(device)
-            measured_band = img.squeeze().detach().cpu().numpy()
+    for local_idx in selected_local_indices:
+        group = group_by_local[local_idx]
+        global_idx = global_by_local[local_idx]
+        fname = tgt_files[global_idx]
 
-            tgt_np = l1_nonneg_normalize(tgt.squeeze())
-            N = len(tgt_np)
-            z = np.arange(N) * dx_um
+        img, tgt = val_dataset[local_idx]
+        img = img.unsqueeze(0).to(device)
+        measured_band = img.squeeze().detach().cpu().numpy()
 
-            pred_nn_t, nn_ms = run_nn(img)
-            pred_nn = l1_nonneg_normalize(pred_nn_t.squeeze().cpu().numpy())
-            pred_nn = l1_nonneg_normalize(
-                align_profile_to_target_center(pred_nn, tgt_np, z, dx_um, fwhm_center, align_by_fwhm)
+        tgt_np = l1_nonneg_normalize(tgt.squeeze())
+        N = len(tgt_np)
+        z = np.arange(N) * dx_um
+        z_centered = (np.arange(N) - N // 2) * dx_um
+
+        pred_nn_t, nn_ms = run_nn(img)
+        pred_nn = l1_nonneg_normalize(pred_nn_t.squeeze().cpu().numpy())
+        pred_nn = l1_nonneg_normalize(
+            align_profile_to_target_center(pred_nn, tgt_np, z, dx_um, fwhm_center, align_by_fwhm)
+        )
+
+        nn_profile_err = profile_nrmse(pred_nn, tgt_np)
+        nn_spec_err = compute_band_spectral_error(
+            pred_nn, measured_band, dx_um, f_min, f_max, pad_factor, compute_form_factor, k_to_THz
+        )
+        if group == "Single":
+            true_struct = fwhm_width(tgt_np, z)
+            nn_struct = fwhm_width(pred_nn, z)
+        else:
+            true_struct = two_peak_separation(tgt_np, z, dx_um)
+            nn_struct = two_peak_separation(pred_nn, z, dx_um)
+        nn_struct_err = np.nan if np.isnan(true_struct) or np.isnan(nn_struct) else abs(nn_struct - true_struct)
+
+        metrics["profile_nrmse"][(group, model_name)].append(nn_profile_err)
+        metrics["spectral_error"][(group, model_name)].append(nn_spec_err)
+        if np.isfinite(nn_struct_err):
+            metrics["structure_error"][(group, model_name)].append(nn_struct_err)
+        timing[model_name].append(nn_ms)
+
+        rho_true = torch.tensor(tgt_np, dtype=torch.float32, device=device)
+        I_meas, _ = forward_spectrum_fft(rho_true)
+        I_meas = I_meas.real
+        I_meas = I_meas / torch.clamp(torch.max(I_meas), min=1e-12)
+
+        support_mask = make_support_mask(N, dx_um, support_width_um, device) if use_support else None
+
+        gs_profile_errs = []
+        gs_spec_errs = []
+        gs_struct_errs = []
+        gs_preds = []
+        gs_time_this_sample = []
+
+        for seed in gs_seeds:
+            torch.manual_seed(int(seed))
+            if getattr(device, "type", None) == "cuda":
+                torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            rho_gs = gerchberg_saxton_1d_torch(
+                I_meas=I_meas,
+                n_iters=gs_iters,
+                support_mask=support_mask,
+                smooth=True,
+                device=device,
+            )
+            if getattr(device, "type", None) == "cuda":
+                torch.cuda.synchronize()
+            t1 = time.perf_counter()
+
+            rho_gs = l1_nonneg_normalize(rho_gs.detach().cpu().numpy())
+            rho_gs = l1_nonneg_normalize(
+                align_profile_to_target_center(rho_gs, tgt_np, z, dx_um, fwhm_center, align_by_fwhm)
             )
 
-            nn_profile_err = profile_nrmse(pred_nn, tgt_np)
-            nn_spec_err = compute_band_spectral_error(
-                pred_nn, measured_band, dx_um, f_min, f_max, pad_factor, compute_form_factor, k_to_THz
+            gs_preds.append(rho_gs)
+            gs_time_this_sample.append((t1 - t0) * 1000.0)
+
+            gs_profile_err = profile_nrmse(rho_gs, tgt_np)
+            gs_profile_errs.append(gs_profile_err)
+            gs_spec_errs.append(
+                compute_band_spectral_error(
+                    rho_gs, measured_band, dx_um, f_min, f_max, pad_factor, compute_form_factor, k_to_THz
+                )
             )
             if group == "Single":
-                true_struct = fwhm_width(tgt_np, z)
-                nn_struct = fwhm_width(pred_nn, z)
+                gs_struct = fwhm_width(rho_gs, z)
             else:
-                true_struct = two_peak_separation(tgt_np, z, dx_um)
-                nn_struct = two_peak_separation(pred_nn, z, dx_um)
-            nn_struct_err = np.nan if np.isnan(true_struct) or np.isnan(nn_struct) else abs(nn_struct - true_struct)
+                gs_struct = two_peak_separation(rho_gs, z, dx_um)
+            gs_struct_err = np.nan if np.isnan(true_struct) or np.isnan(gs_struct) else abs(gs_struct - true_struct)
+            gs_struct_errs.append(gs_struct_err)
 
-            metrics["profile_nrmse"][(group, model_name)].append(nn_profile_err)
-            metrics["spectral_error"][(group, model_name)].append(nn_spec_err)
-            if np.isfinite(nn_struct_err):
-                metrics["structure_error"][(group, model_name)].append(nn_struct_err)
-            timing[model_name].append(nn_ms)
+        valid_gs_profile_errs = _finite_array(gs_profile_errs)
+        valid_gs_spec_errs = _finite_array(gs_spec_errs)
+        valid_gs_struct_errs = _finite_array(gs_struct_errs)
 
-            rho_true = torch.tensor(tgt_np, dtype=torch.float32, device=device)
-            I_meas, _ = forward_spectrum_fft(rho_true)
-            I_meas = I_meas.real
-            I_meas = I_meas / torch.clamp(torch.max(I_meas), min=1e-12)
+        gs_profile_median = float(np.median(valid_gs_profile_errs)) if len(valid_gs_profile_errs) else np.nan
+        gs_spec_median = float(np.median(valid_gs_spec_errs)) if len(valid_gs_spec_errs) else np.nan
+        gs_struct_median = float(np.median(valid_gs_struct_errs)) if len(valid_gs_struct_errs) else np.nan
 
-            support_mask = make_support_mask(N, dx_um, support_width_um, device) if use_support else None
+        if np.isfinite(gs_profile_median):
+            metrics["profile_nrmse"][(group, METHOD_GS)].append(gs_profile_median)
+            gs_seed_spread[group].append(float(np.std(valid_gs_profile_errs)))
+        if np.isfinite(gs_spec_median):
+            metrics["spectral_error"][(group, METHOD_GS)].append(gs_spec_median)
+        if np.isfinite(gs_struct_median):
+            metrics["structure_error"][(group, METHOD_GS)].append(gs_struct_median)
+        timing[METHOD_GS].append(float(np.mean(gs_time_this_sample)))
 
-            gs_profile_errs = []
-            gs_spec_errs = []
-            gs_struct_errs = []
-            gs_preds = []
-            gs_time_this_sample = []
+        complexity = single_shape_complexity(tgt_np, z_centered) if group == "Single" else np.nan
+        charge_ratio = single_left_right_charge_ratio(tgt_np, z_centered) if group == "Single" else np.nan
 
-            for seed in gs_seeds:
-                torch.manual_seed(int(seed))
-                if getattr(device, "type", None) == "cuda":
-                    torch.cuda.synchronize()
-                t0 = time.perf_counter()
-                rho_gs = gerchberg_saxton_1d_torch(
-                    I_meas=I_meas,
-                    n_iters=gs_iters,
-                    support_mask=support_mask,
-                    smooth=True,
-                    device=device,
-                )
-                if getattr(device, "type", None) == "cuda":
-                    torch.cuda.synchronize()
-                t1 = time.perf_counter()
+        record = {
+            "local_idx": int(local_idx),
+            "global_idx": int(global_idx),
+            "fname": fname,
+            "group": group,
+            "target": tgt_np,
+            model_name: pred_nn,
+            "nn_pred": pred_nn,
+            "gs_preds": [np.asarray(p, dtype=float) for p in gs_preds],
+            "gs_seeds": tuple(gs_seeds),
+            "gs_median": np.median(np.vstack(gs_preds), axis=0) if len(gs_preds) else None,
+            "gs_min": np.min(np.vstack(gs_preds), axis=0) if len(gs_preds) else None,
+            "gs_max": np.max(np.vstack(gs_preds), axis=0) if len(gs_preds) else None,
+            METHOD_GS: gs_preds[0] if len(gs_preds) else None,
+            "measured_band": measured_band,
+            "nn_profile_err": nn_profile_err,
+            "gs_profile_errs": list(gs_profile_errs),
+            "gs_profile_err_median": gs_profile_median,
+            "nn_spec_err": nn_spec_err,
+            "gs_spec_errs": list(gs_spec_errs),
+            "gs_spec_err_median": gs_spec_median,
+            "nn_struct_err": nn_struct_err,
+            "gs_struct_errs": list(gs_struct_errs),
+            "gs_struct_err_median": gs_struct_median,
+            "complexity": complexity,
+            "charge_ratio": charge_ratio,
+            "selected_for_vis": local_idx in vis_set,
+        }
+        sample_records[int(local_idx)] = record
 
-                rho_gs = l1_nonneg_normalize(rho_gs.detach().cpu().numpy())
-                rho_gs = l1_nonneg_normalize(
-                    align_profile_to_target_center(rho_gs, tgt_np, z, dx_um, fwhm_center, align_by_fwhm)
-                )
+        if group == "Single" and np.isfinite(complexity) and np.isfinite(charge_ratio):
+            single_advantage_records.append({
+                "local_idx": int(local_idx),
+                "complexity": float(complexity),
+                "charge_ratio": float(charge_ratio),
+                "nn_error": float(nn_profile_err),
+                "gs_error": float(gs_profile_median) if np.isfinite(gs_profile_median) else np.nan,
+                "advantage": float(gs_profile_median - nn_profile_err) if np.isfinite(gs_profile_median) else np.nan,
+            })
 
-                gs_preds.append(rho_gs)
-                gs_time_this_sample.append((t1 - t0) * 1000.0)
-
-                gs_profile_errs.append(profile_nrmse(rho_gs, tgt_np))
-                gs_spec_errs.append(
-                    compute_band_spectral_error(
-                        rho_gs, measured_band, dx_um, f_min, f_max, pad_factor, compute_form_factor, k_to_THz
-                    )
-                )
-                if group == "Single":
-                    gs_struct = fwhm_width(rho_gs, z)
-                else:
-                    gs_struct = two_peak_separation(rho_gs, z, dx_um)
-                gs_struct_err = np.nan if np.isnan(true_struct) or np.isnan(gs_struct) else abs(gs_struct - true_struct)
-                gs_struct_errs.append(gs_struct_err)
-
-            valid_gs_profile_errs = _finite_array(gs_profile_errs)
-            valid_gs_spec_errs = _finite_array(gs_spec_errs)
-            valid_gs_struct_errs = _finite_array(gs_struct_errs)
-
-            if len(valid_gs_profile_errs) > 0:
-                metrics["profile_nrmse"][(group, METHOD_GS)].append(float(np.median(valid_gs_profile_errs)))
-                gs_seed_spread[group].append(float(np.std(valid_gs_profile_errs)))
-            if len(valid_gs_spec_errs) > 0:
-                metrics["spectral_error"][(group, METHOD_GS)].append(float(np.median(valid_gs_spec_errs)))
-            if len(valid_gs_struct_errs) > 0:
-                metrics["structure_error"][(group, METHOD_GS)].append(float(np.median(valid_gs_struct_errs)))
-            timing[METHOD_GS].append(float(np.mean(gs_time_this_sample)))
-
-            example_record = {
-                "local_idx": local_idx,
-                "group": group,
-                "target": tgt_np,
-                model_name: pred_nn,
-                METHOD_GS: gs_preds[0] if len(gs_preds) else None,
-                "measured_band": measured_band,
-            }
-            example_bank.append(example_record)
-            if local_idx in vis_set:
-                ex = dict(example_record)
-                ex["vis_pos"] = list(vis_indices).index(local_idx)
-                examples.append(ex)
-
-    # Fallback: if requested vis_indices are not in selected single/double pool, fill from available examples.
-    examples = sorted(examples, key=lambda d: d["vis_pos"])
+    examples = [sample_records[idx] for idx in vis_indices if idx in sample_records]
     if len(examples) < len(vis_indices):
         used = {ex["local_idx"] for ex in examples}
-        for ex in example_bank:
-            if ex["local_idx"] not in used:
-                examples.append(ex)
-                used.add(ex["local_idx"])
+        for idx in selected_local_indices:
+            if idx not in used:
+                examples.append(sample_records[idx])
+                used.add(idx)
             if len(examples) >= len(vis_indices):
                 break
-    examples = examples[: len(vis_indices)] if len(vis_indices) > 0 else examples[:3]
 
     summary = {}
     for metric_name, metric_dict in metrics.items():
@@ -440,8 +572,11 @@ def build_quantitative_cache(
     return {
         "metrics": metrics,
         "gs_seed_spread": gs_seed_spread,
-        "selected_indices": dict(selected_indices),
+        "selected_indices": selection["by_group"],
+        "selected_local_indices": list(selected_local_indices),
+        "sample_records": sample_records,
         "examples": examples,
+        "single_advantage_records": single_advantage_records,
         "summary": summary,
         "timing": timing_summary,
         "config": {
@@ -456,48 +591,77 @@ def build_quantitative_cache(
             "use_support": use_support,
             "support_width_um": support_width_um,
             "vis_indices": tuple(vis_indices),
+            "forced_vis_indices_in_cache": tuple(selection["forced_vis_indices"]),
+            "n_random_samples": int(len(selected_local_indices)),
+            "sample_seed": int(sample_seed),
+            "single_heatmap_definition": {
+                "x": "Shape complexity = L1 distance to a moment-matched Gaussian",
+                "y": "Charge ratio = max(Q_left, Q_right) / min(Q_left, Q_right)",
+                "score": "GS median profile NRMSE - NN profile NRMSE; positive means NN is better",
+            },
         },
     }
 
 
-def plot_representative_examples(cache, figsize=(8.5, 10.5)):
+def plot_representative_examples(cache, vis_indices=None, figsize=(8.5, 10.5), gs_seed_styles=None):
     setup_prab_style()
     cfg = cache["config"]
     model_name = cfg["model_name"]
-    examples = cache.get("examples", [])
+    sample_records = cache.get("sample_records", {})
 
-    if len(examples) == 0:
+    if vis_indices is None:
+        vis_indices = cfg.get("vis_indices", ())
+    vis_indices = tuple(vis_indices)
+
+    if gs_seed_styles is None:
+        gs_seed_styles = ["-", "--", ":", "-.", (0, (5, 1)), (0, (3, 1, 1, 1))]
+
+    records = [sample_records[idx] for idx in vis_indices if idx in sample_records]
+    if len(records) == 0:
         fig, ax = plt.subplots(1, 1, figsize=figsize)
-        ax.text(0.5, 0.5, "No representative single/double examples available", ha="center", va="center", transform=ax.transAxes)
+        ax.text(0.5, 0.5, "Requested vis_indices are not available in cache", ha="center", va="center", transform=ax.transAxes)
         ax.set_axis_off()
         fig.tight_layout()
         return fig, [ax]
 
-    nrows = len(examples)
+    nrows = len(records)
     fig, axes = plt.subplots(nrows, 1, figsize=figsize, sharex=False)
     if nrows == 1:
         axes = [axes]
 
-    for ax, ex in zip(axes, examples):
+    for ax, ex in zip(axes, records):
         target = ex["target"]
         pred_nn = ex[model_name]
-        pred_gs = ex[METHOD_GS]
+        gs_preds = ex.get("gs_preds", [])
+        gs_seeds = ex.get("gs_seeds", ())
+        gs_min = ex.get("gs_min", None)
+        gs_max = ex.get("gs_max", None)
         N = len(target)
         z_um = (np.arange(N) - N // 2) * cfg["dx_um"]
 
         ax.plot(z_um, target, color=COLORS["target"], label="Target")
         ax.plot(z_um, pred_nn, "--", color=COLORS[METHOD_NN], label=model_name)
-        gs_label = f"GS ({cfg['gs_iters']} iters"
-        if cfg["use_support"]:
-            gs_label += f", support={cfg['support_width_um']:.0f} μm)"
-        else:
-            gs_label += ")"
-        ax.plot(z_um, pred_gs, "-.", color=COLORS[METHOD_GS], label=gs_label)
+
+        if gs_min is not None and gs_max is not None:
+            ax.fill_between(z_um, gs_min, gs_max, color=COLORS[METHOD_GS], alpha=0.16, label="GS seed envelope")
+
+        for i, (seed, pred_gs) in enumerate(zip(gs_seeds, gs_preds)):
+            ls = gs_seed_styles[i % len(gs_seed_styles)]
+            ax.plot(
+                z_um,
+                pred_gs,
+                linestyle=ls,
+                color=COLORS[METHOD_GS],
+                linewidth=1.8,
+                alpha=0.95,
+                label=f"GS seed {seed}",
+            )
+
         ax.set_xlabel("z (μm)")
         ax.set_ylabel(r"L1-normalized $\rho(z)$")
         ax.set_title(f"Validation sample {ex['local_idx']} ({ex['group']})")
         ax.grid(True)
-        ax.legend(loc="best")
+        ax.legend(loc="best", ncol=2)
 
     fig.tight_layout()
     return fig, axes
@@ -532,8 +696,8 @@ def plot_panel_bc_double(cache, figsize=(11.0, 4.8)):
         cache["metrics"]["spectral_error"],
         groups=["Double"],
         methods=[model_name, METHOD_GS],
-        ylabel="||F_rec - F_meas||_2 / ||F_meas||_2",
-        title="(b) Double-bunch spectral mismatch",
+        ylabel=r"$\|F_{\mathrm{rec}}-F_{\mathrm{meas}}\|_2 / \|F_{\mathrm{meas}}\|_2$",
+        title="(b) Spectral mismatch",
         xticklabels=["Double"],
         colors={model_name: COLORS[METHOD_NN], METHOD_GS: COLORS[METHOD_GS]},
         show_legend=True,
@@ -544,62 +708,88 @@ def plot_panel_bc_double(cache, figsize=(11.0, 4.8)):
         cache["metrics"]["structure_error"],
         groups=["Double"],
         methods=[model_name, METHOD_GS],
-        ylabel=r"$|\Delta$ peak separation$|$ (μm)",
-        title="(c) Double-bunch separation error",
+        ylabel=r"$|\Delta$ separation$|$ (μm)",
+        title="(c) Peak-separation error",
         xticklabels=["Double"],
         colors={model_name: COLORS[METHOD_NN], METHOD_GS: COLORS[METHOD_GS]},
         show_legend=True,
     )
 
+    fig.suptitle("Double-bunch spectral and separation errors", y=1.02)
     fig.tight_layout()
     return fig, axes
 
 
 def plot_panel_d(cache, figsize=(7.2, 5.1)):
     setup_prab_style()
-    model_name = cache["config"]["model_name"]
     fig, ax = plt.subplots(1, 1, figsize=figsize)
+    ax.text(
+        0.5,
+        0.5,
+        "Panel (d) is intentionally folded into the representative-example figure:\n"
+        "GS seed dependence is shown by three green seed curves plus the green envelope.",
+        ha="center",
+        va="center",
+        transform=ax.transAxes,
+    )
+    ax.set_axis_off()
+    fig.tight_layout()
+    return fig, ax
 
-    single = _finite_array(cache["gs_seed_spread"].get("Single", []))
-    double = _finite_array(cache["gs_seed_spread"].get("Double", []))
 
-    if len(single) == 0 and len(double) == 0:
-        ax.text(0.5, 0.5, "No finite GS seed-spread values available", ha="center", va="center", transform=ax.transAxes)
+def plot_single_advantage_heatmap(
+    cache,
+    figsize=(7.6, 5.6),
+    x_bins=12,
+    y_bins=10,
+    min_count_per_bin=3,
+):
+    setup_prab_style()
+    records = cache.get("single_advantage_records", [])
+
+    xs = np.array([r["complexity"] for r in records], dtype=float)
+    ys = np.array([r["charge_ratio"] for r in records], dtype=float)
+    scores = np.array([r["advantage"] for r in records], dtype=float)
+
+    finite = np.isfinite(xs) & np.isfinite(ys) & np.isfinite(scores)
+    xs = xs[finite]
+    ys = ys[finite]
+    scores = scores[finite]
+
+    fig, ax = plt.subplots(1, 1, figsize=figsize)
+    if len(xs) == 0:
+        ax.text(0.5, 0.5, "No finite single-bunch heatmap data available", ha="center", va="center", transform=ax.transAxes)
         ax.set_axis_off()
         fig.tight_layout()
         return fig, ax
 
-    data = [single if len(single) else np.array([np.nan]), double if len(double) else np.array([np.nan])]
-    positions = [0, 3]
+    x_edges = np.linspace(xs.min(), xs.max(), x_bins + 1)
+    y_edges = np.linspace(ys.min(), ys.max(), y_bins + 1)
 
-    bp = ax.boxplot(
-        data,
-        positions=positions,
-        widths=0.9,
-        patch_artist=True,
-        showfliers=False,
-        medianprops=dict(color="black", linewidth=1.8),
-        whiskerprops=dict(linewidth=1.2),
-        capprops=dict(linewidth=1.2),
-        boxprops=dict(linewidth=1.2),
-    )
-    for patch in bp["boxes"]:
-        patch.set_facecolor(COLORS[METHOD_GS])
-        patch.set_alpha(0.65)
+    sum_grid, _, _ = np.histogram2d(xs, ys, bins=[x_edges, y_edges], weights=scores)
+    cnt_grid, _, _ = np.histogram2d(xs, ys, bins=[x_edges, y_edges])
 
-    ax.axhline(0.0, color=COLORS[METHOD_NN], linestyle="--", linewidth=2.0, label=f"{model_name} (deterministic)")
-    ax.set_xticks(positions)
-    ax.set_xticklabels(["Single", "Double"])
-    ax.set_ylabel("Std. of GS profile NRMSE across seeds")
-    ax.set_title("(d) GS procedural variability")
-    ax.grid(axis="y")
-    ax.legend(loc="best")
+    with np.errstate(invalid="ignore", divide="ignore"):
+        mean_grid = sum_grid / cnt_grid
+    mean_grid[cnt_grid < int(min_count_per_bin)] = np.nan
+
+    mesh = ax.pcolormesh(x_edges, y_edges, mean_grid.T, shading="auto", cmap="coolwarm")
+    cbar = fig.colorbar(mesh, ax=ax)
+    cbar.set_label(r"$\Delta$accuracy = NRMSE$_{GS,med}$ - NRMSE$_{NN}$")
+
+    ax.set_xlabel("Shape complexity (distance from matched Gaussian)")
+    ax.set_ylabel("Left/right charge ratio")
+    ax.set_title("Single-bunch advantage map (positive: dilated ResNet better)")
+    ax.grid(False)
+
     fig.tight_layout()
     return fig, ax
 
 
 def print_cache_summary(cache):
     print("Selected validation samples")
+    print(f"  total: {len(cache.get('selected_local_indices', []))}")
+    print(f"  forced vis indices in cache: {cache['config'].get('forced_vis_indices_in_cache', ())}")
     for group in GROUP_ORDER:
         print(f"  {group}: {len(cache['selected_indices'].get(group, []))}")
 
@@ -619,3 +809,11 @@ def print_cache_summary(cache):
                     f"{group:>6s} | {method:>18s} : "
                     f"{s['median']:.4f} [{s['q25']:.4f}, {s['q75']:.4f}]  n={s['n']}"
                 )
+
+    info = cache["config"].get("single_heatmap_definition", None)
+    if info is not None:
+        print("\nSingle-bunch heatmap definition")
+        print("-------------------------------")
+        print(f"  x-axis : {info['x']}")
+        print(f"  y-axis : {info['y']}")
+        print(f"  score  : {info['score']}")
