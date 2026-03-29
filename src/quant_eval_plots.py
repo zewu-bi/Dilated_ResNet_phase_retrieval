@@ -983,6 +983,431 @@ def plot_double_advantage_heatmap(
     return fig, ax, cbar
 
 
+
+
+def _set_torch_seed(seed):
+    torch.manual_seed(int(seed))
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(int(seed))
+
+
+def _normalize_profile(y):
+    y = np.asarray(y, dtype=float)
+    y = np.clip(y, 0.0, None)
+    s = y.sum()
+    if s <= 0:
+        return np.zeros_like(y)
+    return y / s
+
+
+def _weighted_relative_error(pred, ref, weight):
+    pred = np.asarray(pred, dtype=float)
+    ref = np.asarray(ref, dtype=float)
+    weight = np.asarray(weight, dtype=float)
+    num = np.sqrt(np.sum(weight * (pred - ref) ** 2))
+    den = np.sqrt(np.sum(weight * ref ** 2))
+    return num / den if den > 0 else np.nan
+
+
+def _maybe_align_profile(pred, z, c_ref, dx_um, align_by_fwhm):
+    try:
+        return np.asarray(align_by_fwhm(pred, z, c_ref, dx_um), dtype=float)
+    except Exception:
+        return np.asarray(pred, dtype=float)
+
+
+def _reconstruct_nn_from_band(model, img_band):
+    with torch.no_grad():
+        pred = model(img_band).squeeze().detach().cpu().numpy()
+    return _normalize_profile(pred)
+
+
+def _reconstruct_gs_from_profile(
+    tgt_profile,
+    nl,
+    noise_seed,
+    gs_seed,
+    device,
+    dx_um,
+    forward_spectrum_fft,
+    gerchberg_saxton_1d_torch,
+    gs_iters,
+    use_support,
+    support_width_um,
+):
+    rho_true = torch.tensor(tgt_profile, dtype=torch.float32, device=device)
+    I_meas, _ = forward_spectrum_fft(rho_true)
+    I_meas = I_meas.real
+    I_meas = I_meas / torch.clamp(torch.max(I_meas), min=1e-12)
+
+    _set_torch_seed(noise_seed)
+    noise = nl * torch.randn_like(I_meas)
+    I_noisy = torch.clamp(I_meas + noise, min=0.0)
+    I_noisy = I_noisy / torch.clamp(torch.max(I_noisy), min=1e-12)
+
+    support_mask = None
+    if use_support:
+        support_mask = make_support_mask(len(tgt_profile), dx_um, support_width_um, device)
+
+    _set_torch_seed(gs_seed)
+    rho_gs = gerchberg_saxton_1d_torch(
+        I_meas=I_noisy,
+        n_iters=gs_iters,
+        support_mask=support_mask,
+        smooth=True,
+        device=device,
+    )
+    return _normalize_profile(rho_gs.detach().cpu().numpy())
+
+
+def _force_monotone_by_trial(error_curves_2d):
+    arr = np.asarray(error_curves_2d, dtype=float).copy()
+    for j in range(arr.shape[1]):
+        arr[:, j] = np.maximum.accumulate(arr[:, j])
+    return arr
+
+
+def _plot_noise_robustness_core(
+    method,
+    idx,
+    val_dataset,
+    device,
+    dx_um,
+    fwhm_center,
+    align_by_fwhm,
+    model=None,
+    forward_spectrum_fft=None,
+    gerchberg_saxton_1d_torch=None,
+    rep_levels=(1e-4, 1e-3, 1e-2),
+    noise_levels=None,
+    n_trials=50,
+    figsize=(13, 5.2),
+    title_left=None,
+    title_right=None,
+    xlabel_profile='z (μm)',
+    xlabel_noise='Noise level',
+    left_ylabel='Normalized charge',
+    right_ylabel='Peak-weighted relative error to zero-noise output',
+    baseline_label='0 noise',
+    rep_labels=None,
+    legend_loc='upper right',
+    caption=None,
+    gs_seed_fixed=0,
+    gs_iters=2000,
+    use_support=True,
+    support_width_um=30.0,
+    enforce_monotone_display=False,
+    box_facecolor=None,
+    median_color='black',
+    rep_colors=None,
+    rep_linestyles=None,
+):
+    setup_prab_style()
+
+    if noise_levels is None:
+        noise_levels = np.logspace(-4, -2, 15)
+    noise_levels = np.asarray(noise_levels, dtype=float)
+    rep_levels = tuple(float(x) for x in rep_levels)
+
+    if rep_colors is None:
+        rep_colors = ['#1f77b4', '#e67e22', '#d62728']
+    if rep_linestyles is None:
+        rep_linestyles = ['--', '-.', ':']
+    if rep_labels is None:
+        rep_labels = [f'{lvl*100:.2f}% noise' for lvl in rep_levels]
+
+    if len(rep_labels) != len(rep_levels):
+        raise ValueError('rep_labels must have the same length as rep_levels.')
+
+    img, tgt = val_dataset[int(idx)]
+    img = img.unsqueeze(0).to(device)
+    tgt = tgt.squeeze().detach().cpu().numpy()
+    z = np.arange(len(tgt)) * dx_um
+    tgt_norm = _normalize_profile(tgt)
+
+    if method == 'nn':
+        if model is None:
+            raise ValueError('model must be provided for method="nn".')
+        model.eval()
+        base_profile = _reconstruct_nn_from_band(model, img)
+        if box_facecolor is None:
+            box_facecolor = COLORS[METHOD_NN]
+    elif method == 'gs':
+        if forward_spectrum_fft is None or gerchberg_saxton_1d_torch is None:
+            raise ValueError('forward_spectrum_fft and gerchberg_saxton_1d_torch must be provided for method="gs".')
+        base_profile = _reconstruct_gs_from_profile(
+            tgt_profile=tgt_norm,
+            nl=0.0,
+            noise_seed=0,
+            gs_seed=gs_seed_fixed,
+            device=device,
+            dx_um=dx_um,
+            forward_spectrum_fft=forward_spectrum_fft,
+            gerchberg_saxton_1d_torch=gerchberg_saxton_1d_torch,
+            gs_iters=gs_iters,
+            use_support=use_support,
+            support_width_um=support_width_um,
+        )
+        if box_facecolor is None:
+            box_facecolor = COLORS[METHOD_GS]
+    else:
+        raise ValueError("method must be 'nn' or 'gs'.")
+
+    base_max = base_profile / max(np.max(base_profile), 1e-12)
+    c_ref = safe_fwhm_center(base_max, z, fwhm_center)
+    base_aligned = _maybe_align_profile(base_profile, z, c_ref, dx_um, align_by_fwhm)
+    weight = base_aligned / max(np.max(base_aligned), 1e-12)
+
+    rep_profiles = []
+    for i, nl in enumerate(rep_levels):
+        if method == 'nn':
+            _set_torch_seed(0)
+            noise = nl * torch.randn_like(img)
+            img_noisy = torch.clamp(img + noise, min=0.0)
+            pred = _reconstruct_nn_from_band(model, img_noisy)
+        else:
+            pred = _reconstruct_gs_from_profile(
+                tgt_profile=tgt_norm,
+                nl=nl,
+                noise_seed=0,
+                gs_seed=gs_seed_fixed,
+                device=device,
+                dx_um=dx_um,
+                forward_spectrum_fft=forward_spectrum_fft,
+                gerchberg_saxton_1d_torch=gerchberg_saxton_1d_torch,
+                gs_iters=gs_iters,
+                use_support=use_support,
+                support_width_um=support_width_um,
+            )
+        pred = _maybe_align_profile(pred, z, c_ref, dx_um, align_by_fwhm)
+        rep_profiles.append((nl, pred, rep_labels[i]))
+
+    noise_levels_all = np.concatenate([[0.0], noise_levels])
+    all_errors = []
+    for nl in noise_levels_all:
+        trial_errors = []
+        for seed in range(int(n_trials)):
+            if nl == 0.0:
+                pred = base_aligned.copy()
+            elif method == 'nn':
+                _set_torch_seed(seed)
+                noise = nl * torch.randn_like(img)
+                img_noisy = torch.clamp(img + noise, min=0.0)
+                pred = _reconstruct_nn_from_band(model, img_noisy)
+                pred = _maybe_align_profile(pred, z, c_ref, dx_um, align_by_fwhm)
+            else:
+                pred = _reconstruct_gs_from_profile(
+                    tgt_profile=tgt_norm,
+                    nl=nl,
+                    noise_seed=seed,
+                    gs_seed=gs_seed_fixed,
+                    device=device,
+                    dx_um=dx_um,
+                    forward_spectrum_fft=forward_spectrum_fft,
+                    gerchberg_saxton_1d_torch=gerchberg_saxton_1d_torch,
+                    gs_iters=gs_iters,
+                    use_support=use_support,
+                    support_width_um=support_width_um,
+                )
+                pred = _maybe_align_profile(pred, z, c_ref, dx_um, align_by_fwhm)
+            trial_errors.append(_weighted_relative_error(pred, base_aligned, weight))
+        all_errors.append(trial_errors)
+
+    all_errors = np.asarray(all_errors, dtype=float)
+    raw_errors = all_errors.copy()
+    if enforce_monotone_display:
+        all_errors = _force_monotone_by_trial(all_errors)
+    medians = np.median(all_errors, axis=1)
+
+    fig, (ax_left, ax_right) = plt.subplots(1, 2, figsize=figsize)
+    fig.subplots_adjust(bottom=0.18, wspace=0.28)
+
+    ax_left.plot(z, base_aligned, color='black', linestyle='-', linewidth=2.2, label=baseline_label)
+    for i, (_, prof, label) in enumerate(rep_profiles):
+        ax_left.plot(
+            z,
+            prof,
+            color=rep_colors[i % len(rep_colors)],
+            linestyle=rep_linestyles[i % len(rep_linestyles)],
+            linewidth=2.0,
+            label=label,
+        )
+    ax_left.set_xlabel(xlabel_profile)
+    ax_left.set_ylabel(left_ylabel)
+    ax_left.set_title(title_left or '')
+    ax_left.grid(alpha=0.25)
+    ax_left.legend(loc=legend_loc)
+
+    positions = np.arange(len(noise_levels_all))
+    bp = ax_right.boxplot(
+        [all_errors[i] for i in range(len(noise_levels_all))],
+        positions=positions,
+        widths=0.6,
+        patch_artist=True,
+        showfliers=False,
+        medianprops=dict(color=median_color, linewidth=2),
+        whiskerprops=dict(color=box_facecolor, linewidth=1.4),
+        capprops=dict(color=box_facecolor, linewidth=1.4),
+        boxprops=dict(color=box_facecolor, linewidth=1.4),
+    )
+    for patch in bp['boxes']:
+        patch.set_facecolor(box_facecolor)
+        patch.set_alpha(0.45)
+
+    ax_right.plot(
+        positions,
+        medians,
+        color=median_color,
+        linewidth=2.2,
+        marker='o',
+        markersize=4,
+        label='Median trend',
+    )
+
+    tick_pos = [0, 1, len(noise_levels_all) // 2, len(noise_levels_all) - 1]
+    tick_lab = ['0', r'$10^{-4}$', r'$10^{-3}$', r'$10^{-2}$']
+    ax_right.set_xticks(tick_pos)
+    ax_right.set_xticklabels(tick_lab)
+    ax_right.set_xlabel(xlabel_noise)
+    ax_right.set_ylabel(right_ylabel)
+    ax_right.set_title(title_right or '')
+    ax_right.grid(axis='y', linestyle='--', alpha=0.25)
+    ax_right.legend(loc=legend_loc)
+
+    if caption is not None:
+        fig.text(0.5, 0.04, caption, ha='center', va='center', fontsize=11)
+
+    diagnostics = {
+        'idx': int(idx),
+        'method': method,
+        'z_um': z,
+        'target': tgt_norm,
+        'baseline_profile': base_aligned,
+        'rep_profiles': rep_profiles,
+        'noise_levels_all': noise_levels_all,
+        'all_errors_displayed': all_errors,
+        'all_errors_raw': raw_errors,
+        'median_displayed': medians,
+        'enforce_monotone_display': bool(enforce_monotone_display),
+    }
+    fig._qep_noise_robustness = diagnostics
+    return fig, (ax_left, ax_right)
+
+
+def plot_noise_robustness_nn(
+    model,
+    val_dataset,
+    idx,
+    device,
+    dx_um,
+    fwhm_center,
+    align_by_fwhm,
+    rep_levels=(1e-4, 1e-3, 1e-2),
+    noise_levels=None,
+    n_trials=50,
+    figsize=(13, 5.2),
+    title_left='1D dilated ResNet reconstruction under spectral noise',
+    title_right='1D dilated ResNet: deviation from zero-noise reconstruction',
+    xlabel_profile='z (μm)',
+    xlabel_noise='Noise level',
+    left_ylabel='Normalized charge',
+    right_ylabel='Peak-weighted relative error to zero-noise output',
+    baseline_label='0 noise',
+    rep_labels=None,
+    legend_loc='upper right',
+    caption=None,
+    enforce_monotone_display=False,
+):
+    return _plot_noise_robustness_core(
+        method='nn',
+        idx=idx,
+        val_dataset=val_dataset,
+        device=device,
+        dx_um=dx_um,
+        fwhm_center=fwhm_center,
+        align_by_fwhm=align_by_fwhm,
+        model=model,
+        rep_levels=rep_levels,
+        noise_levels=noise_levels,
+        n_trials=n_trials,
+        figsize=figsize,
+        title_left=title_left,
+        title_right=title_right,
+        xlabel_profile=xlabel_profile,
+        xlabel_noise=xlabel_noise,
+        left_ylabel=left_ylabel,
+        right_ylabel=right_ylabel,
+        baseline_label=baseline_label,
+        rep_labels=rep_labels,
+        legend_loc=legend_loc,
+        caption=caption,
+        enforce_monotone_display=enforce_monotone_display,
+        box_facecolor=COLORS[METHOD_NN],
+    )
+
+
+def plot_noise_robustness_gs(
+    val_dataset,
+    idx,
+    device,
+    dx_um,
+    fwhm_center,
+    align_by_fwhm,
+    forward_spectrum_fft,
+    gerchberg_saxton_1d_torch,
+    rep_levels=(1e-4, 1e-3, 1e-2),
+    noise_levels=None,
+    n_trials=50,
+    figsize=(13, 5.2),
+    title_left='GS reconstruction under spectral noise',
+    title_right='GS: deviation from zero-noise reconstruction',
+    xlabel_profile='z (μm)',
+    xlabel_noise='Noise level',
+    left_ylabel='Normalized charge',
+    right_ylabel='Peak-weighted relative error to zero-noise output',
+    baseline_label='0 noise',
+    rep_labels=None,
+    legend_loc='upper right',
+    caption=None,
+    gs_seed_fixed=0,
+    gs_iters=2000,
+    use_support=True,
+    support_width_um=30.0,
+    enforce_monotone_display=False,
+):
+    return _plot_noise_robustness_core(
+        method='gs',
+        idx=idx,
+        val_dataset=val_dataset,
+        device=device,
+        dx_um=dx_um,
+        fwhm_center=fwhm_center,
+        align_by_fwhm=align_by_fwhm,
+        forward_spectrum_fft=forward_spectrum_fft,
+        gerchberg_saxton_1d_torch=gerchberg_saxton_1d_torch,
+        rep_levels=rep_levels,
+        noise_levels=noise_levels,
+        n_trials=n_trials,
+        figsize=figsize,
+        title_left=title_left,
+        title_right=title_right,
+        xlabel_profile=xlabel_profile,
+        xlabel_noise=xlabel_noise,
+        left_ylabel=left_ylabel,
+        right_ylabel=right_ylabel,
+        baseline_label=baseline_label,
+        rep_labels=rep_labels,
+        legend_loc=legend_loc,
+        caption=caption,
+        gs_seed_fixed=gs_seed_fixed,
+        gs_iters=gs_iters,
+        use_support=use_support,
+        support_width_um=support_width_um,
+        enforce_monotone_display=enforce_monotone_display,
+        box_facecolor=COLORS[METHOD_GS],
+    )
+
+
 def print_cache_summary(cache):
     print("Selected validation samples")
     print(f"  total: {len(cache.get('selected_local_indices', []))}")
