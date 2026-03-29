@@ -1,3 +1,4 @@
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -31,6 +32,44 @@ def align_by_fwhm(profile, x, reference_center, dx_um):
     c = fwhm_center(profile_max, x)
     shift_pts = int(np.round((c - reference_center) / dx_um))
     return np.roll(profile, -shift_pts)
+
+
+def shift_with_zero_fill(profile, shift_pts):
+    """
+    Shift a 1D profile with zero padding instead of periodic wrapping.
+
+    Positive shift_pts moves the profile to the right.
+    Negative shift_pts moves the profile to the left.
+    """
+    arr = np.asarray(profile)
+    shift_pts = int(shift_pts)
+    out = np.zeros_like(arr)
+
+    if shift_pts == 0:
+        return arr.copy()
+
+    n = arr.shape[0]
+    if shift_pts >= n or shift_pts <= -n:
+        return out
+
+    if shift_pts > 0:
+        out[shift_pts:] = arr[: n - shift_pts]
+    else:
+        out[: n + shift_pts] = arr[-shift_pts:]
+
+    return out
+
+
+def align_by_fwhm_nonperiodic(profile, x, reference_center, dx_um):
+    """
+    Same intent as align_by_fwhm, but uses zero-filled shifting so the two
+    ends of the axis are not treated as connected.
+    """
+    arr = np.asarray(profile)
+    profile_max = arr / np.max(arr) if np.max(arr) > 0 else arr
+    c = fwhm_center(profile_max, x)
+    shift_pts = int(np.round((c - reference_center) / dx_um))
+    return shift_with_zero_fill(arr, -shift_pts)
 
 
 def weighted_error(pred, target, weight):
