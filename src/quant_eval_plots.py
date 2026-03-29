@@ -1067,7 +1067,8 @@ def _force_monotone_by_trial(error_curves_2d):
     return arr
 
 
-def _plot_noise_robustness_core(
+
+def _compute_noise_robustness_diagnostics(
     method,
     idx,
     val_dataset,
@@ -1080,44 +1081,24 @@ def _plot_noise_robustness_core(
     gerchberg_saxton_1d_torch=None,
     rep_levels=(1e-4, 1e-3, 1e-2),
     noise_levels=None,
+    right_noise_levels=None,
     n_trials=50,
-    figsize=(13, 5.2),
-    title_left=None,
-    title_right=None,
-    xlabel_profile='z (μm)',
-    xlabel_noise='Noise level',
-    left_ylabel='Normalized charge',
-    right_ylabel='Peak-weighted relative error to zero-noise output',
-    baseline_label='0 noise',
-    rep_labels=None,
-    legend_loc='upper right',
-    caption=None,
     gs_seed_fixed=0,
     gs_iters=2000,
     use_support=True,
     support_width_um=30.0,
     enforce_monotone_display=False,
-    box_facecolor=None,
-    median_color='black',
-    rep_colors=None,
-    rep_linestyles=None,
 ):
-    setup_prab_style()
+    if right_noise_levels is None:
+        right_noise_levels = noise_levels
+    if right_noise_levels is None:
+        right_noise_levels = np.logspace(-4, -2, 15)
 
-    if noise_levels is None:
-        noise_levels = np.logspace(-4, -2, 15)
-    noise_levels = np.asarray(noise_levels, dtype=float)
+    right_noise_levels = np.asarray(right_noise_levels, dtype=float)
     rep_levels = tuple(float(x) for x in rep_levels)
 
-    if rep_colors is None:
-        rep_colors = ['#1f77b4', '#e67e22', '#d62728']
-    if rep_linestyles is None:
-        rep_linestyles = ['--', '-.', ':']
-    if rep_labels is None:
-        rep_labels = [f'{lvl*100:.2f}% noise' for lvl in rep_levels]
-
-    if len(rep_labels) != len(rep_levels):
-        raise ValueError('rep_labels must have the same length as rep_levels.')
+    if np.any(right_noise_levels <= 0):
+        raise ValueError('right_noise_levels must be strictly positive so the right panel can use a numeric axis.')
 
     img, tgt = val_dataset[int(idx)]
     img = img.unsqueeze(0).to(device)
@@ -1130,8 +1111,7 @@ def _plot_noise_robustness_core(
             raise ValueError('model must be provided for method="nn".')
         model.eval()
         base_profile = _reconstruct_nn_from_band(model, img)
-        if box_facecolor is None:
-            box_facecolor = COLORS[METHOD_NN]
+        method_label = METHOD_NN
     elif method == 'gs':
         if forward_spectrum_fft is None or gerchberg_saxton_1d_torch is None:
             raise ValueError('forward_spectrum_fft and gerchberg_saxton_1d_torch must be provided for method="gs".')
@@ -1148,8 +1128,7 @@ def _plot_noise_robustness_core(
             use_support=use_support,
             support_width_um=support_width_um,
         )
-        if box_facecolor is None:
-            box_facecolor = COLORS[METHOD_GS]
+        method_label = METHOD_GS
     else:
         raise ValueError("method must be 'nn' or 'gs'.")
 
@@ -1159,7 +1138,7 @@ def _plot_noise_robustness_core(
     weight = base_aligned / max(np.max(base_aligned), 1e-12)
 
     rep_profiles = []
-    for i, nl in enumerate(rep_levels):
+    for nl in rep_levels:
         if method == 'nn':
             _set_torch_seed(0)
             noise = nl * torch.randn_like(img)
@@ -1180,16 +1159,13 @@ def _plot_noise_robustness_core(
                 support_width_um=support_width_um,
             )
         pred = _maybe_align_profile(pred, z, c_ref, dx_um, align_by_fwhm)
-        rep_profiles.append((nl, pred, rep_labels[i]))
+        rep_profiles.append((float(nl), pred))
 
-    noise_levels_all = np.concatenate([[0.0], noise_levels])
     all_errors = []
-    for nl in noise_levels_all:
+    for nl in right_noise_levels:
         trial_errors = []
         for seed in range(int(n_trials)):
-            if nl == 0.0:
-                pred = base_aligned.copy()
-            elif method == 'nn':
+            if method == 'nn':
                 _set_torch_seed(seed)
                 noise = nl * torch.randn_like(img)
                 img_noisy = torch.clamp(img + noise, min=0.0)
@@ -1219,30 +1195,119 @@ def _plot_noise_robustness_core(
         all_errors = _force_monotone_by_trial(all_errors)
     medians = np.median(all_errors, axis=1)
 
-    fig, (ax_left, ax_right) = plt.subplots(1, 2, figsize=figsize)
-    fig.subplots_adjust(bottom=0.18, wspace=0.28)
+    return {
+        'idx': int(idx),
+        'method': method,
+        'method_label': method_label,
+        'z_um': z,
+        'target': tgt_norm,
+        'baseline_profile': base_aligned,
+        'rep_profiles': rep_profiles,
+        'right_noise_levels': right_noise_levels.astype(float),
+        'all_errors_displayed': all_errors,
+        'all_errors_raw': raw_errors,
+        'median_displayed': medians,
+        'n_trials': int(n_trials),
+        'enforce_monotone_display': bool(enforce_monotone_display),
+        'gs_seed_fixed': int(gs_seed_fixed),
+        'gs_iters': int(gs_iters),
+        'use_support': bool(use_support),
+        'support_width_um': float(support_width_um),
+    }
 
-    ax_left.plot(z, base_aligned, color='black', linestyle='-', linewidth=2.2, label=baseline_label)
-    for i, (_, prof, label) in enumerate(rep_profiles):
-        ax_left.plot(
-            z,
-            prof,
+
+def _plot_noise_robustness_left_from_diag(
+    diag,
+    figsize=(6.4, 5.0),
+    title=None,
+    xlabel_profile='z (μm)',
+    left_ylabel='Normalized charge',
+    baseline_label='0 noise',
+    rep_labels=None,
+    legend_loc='upper right',
+    baseline_color='black',
+    rep_colors=None,
+    rep_linestyles=None,
+    caption=None,
+):
+    setup_prab_style()
+
+    rep_profiles = diag['rep_profiles']
+    if rep_colors is None:
+        rep_colors = ['#1f77b4', '#e67e22', '#d62728']
+    if rep_linestyles is None:
+        rep_linestyles = ['--', '-.', ':']
+    if rep_labels is None:
+        rep_labels = [f'{nl*100:.2f}% noise' for nl, _ in rep_profiles]
+    if len(rep_labels) != len(rep_profiles):
+        raise ValueError('rep_labels must have the same length as diag["rep_profiles"].')
+
+    fig, ax = plt.subplots(1, 1, figsize=figsize)
+    ax.plot(diag['z_um'], diag['baseline_profile'], color=baseline_color, linestyle='-', linewidth=2.2, label=baseline_label)
+    for i, ((_, prof), label) in enumerate(zip(rep_profiles, rep_labels)):
+        ax.plot(
+            diag['z_um'], prof,
             color=rep_colors[i % len(rep_colors)],
             linestyle=rep_linestyles[i % len(rep_linestyles)],
-            linewidth=2.0,
-            label=label,
+            linewidth=2.0, label=label,
         )
-    ax_left.set_xlabel(xlabel_profile)
-    ax_left.set_ylabel(left_ylabel)
-    ax_left.set_title(title_left or '')
-    ax_left.grid(alpha=0.25)
-    ax_left.legend(loc=legend_loc)
+    ax.set_xlabel(xlabel_profile)
+    ax.set_ylabel(left_ylabel)
+    ax.set_title(title or '')
+    ax.grid(alpha=0.25)
+    ax.legend(loc=legend_loc)
+    if caption is not None:
+        fig.text(0.5, 0.02, caption, ha='center', va='center', fontsize=11)
+    fig.tight_layout()
+    fig._qep_noise_robustness = diag
+    return fig, ax
 
-    positions = np.arange(len(noise_levels_all))
-    bp = ax_right.boxplot(
-        [all_errors[i] for i in range(len(noise_levels_all))],
+
+def _plot_noise_robustness_right_from_diag(
+    diag,
+    figsize=(6.8, 5.0),
+    title=None,
+    xlabel_noise='Noise level',
+    right_ylabel='Peak-weighted relative error to zero-noise output',
+    legend_loc='upper right',
+    caption=None,
+    box_facecolor=None,
+    median_color='black',
+    baseline_color='black',
+    right_xscale='log',
+    right_xticks=None,
+    right_xticklabels=None,
+    curve_label='Median trend',
+    zero_ref_label='Zero-noise reference',
+):
+    setup_prab_style()
+
+    positions = np.asarray(diag['right_noise_levels'], dtype=float)
+    all_errors = np.asarray(diag['all_errors_displayed'], dtype=float)
+    medians = np.asarray(diag['median_displayed'], dtype=float)
+
+    if np.any(positions <= 0):
+        raise ValueError('diag["right_noise_levels"] must be strictly positive.')
+    if right_xscale not in ('log', 'linear'):
+        raise ValueError("right_xscale must be 'log' or 'linear'.")
+
+    if box_facecolor is None:
+        box_facecolor = COLORS[diag['method_label']]
+
+    fig, ax = plt.subplots(1, 1, figsize=figsize)
+    if len(positions) == 1:
+        widths = [0.25 * positions[0]] if right_xscale == 'log' else [max(0.25 * positions[0], 1e-6)]
+    elif right_xscale == 'log':
+        widths = 0.22 * positions
+    else:
+        diffs = np.diff(np.sort(positions))
+        widths = [0.45 * float(np.min(diffs))] * len(positions)
+
+    bp = ax.boxplot(
+        [all_errors[i] for i in range(len(positions))],
         positions=positions,
-        widths=0.6,
+        widths=widths,
+        manage_ticks=False,
         patch_artist=True,
         showfliers=False,
         medianprops=dict(color=median_color, linewidth=2),
@@ -1254,20 +1319,252 @@ def _plot_noise_robustness_core(
         patch.set_facecolor(box_facecolor)
         patch.set_alpha(0.45)
 
-    ax_right.plot(
-        positions,
-        medians,
-        color=median_color,
-        linewidth=2.2,
-        marker='o',
-        markersize=4,
-        label='Median trend',
-    )
+    ax.plot(positions, medians, color=median_color, linewidth=2.2, marker='o', markersize=4, label=curve_label)
+    ax.axhline(0.0, color=baseline_color, linewidth=1.2, linestyle=':', label=zero_ref_label)
 
-    tick_pos = [0, 1, len(noise_levels_all) // 2, len(noise_levels_all) - 1]
-    tick_lab = ['0', r'$10^{-4}$', r'$10^{-3}$', r'$10^{-2}$']
-    ax_right.set_xticks(tick_pos)
-    ax_right.set_xticklabels(tick_lab)
+    ax.set_xscale(right_xscale)
+    if right_xscale == 'log':
+        ax.set_xlim(positions.min() * 0.85, positions.max() * 1.18)
+    else:
+        if len(positions) == 1:
+            pad = max(0.35 * positions[0], 1e-6)
+        else:
+            pad = 0.55 * np.min(np.diff(np.sort(positions)))
+        ax.set_xlim(max(0.0, positions.min() - pad), positions.max() + pad)
+
+    if right_xticks is not None:
+        ax.set_xticks(right_xticks)
+    if right_xticklabels is not None:
+        ax.set_xticklabels(right_xticklabels)
+
+    ax.set_xlabel(xlabel_noise)
+    ax.set_ylabel(right_ylabel)
+    ax.set_title(title or '')
+    ax.grid(axis='y', linestyle='--', alpha=0.25)
+    ax.legend(loc=legend_loc)
+    if caption is not None:
+        fig.text(0.5, 0.02, caption, ha='center', va='center', fontsize=11)
+    fig.tight_layout()
+    fig._qep_noise_robustness = diag
+    return fig, ax
+
+
+def _plot_noise_robustness_combined_right(
+    diag_list,
+    figsize=(7.4, 5.0),
+    title='Noise robustness comparison',
+    xlabel_noise='Noise level',
+    right_ylabel='Peak-weighted relative error to zero-noise output',
+    legend_loc='upper left',
+    caption=None,
+    right_xscale='log',
+    right_xticks=None,
+    right_xticklabels=None,
+    curve_labels=None,
+    curve_colors=None,
+    curve_linestyles=None,
+    show_boxes=True,
+    box_alpha=0.16,
+    show_zero_reference=True,
+    baseline_color='black',
+):
+    setup_prab_style()
+    if len(diag_list) == 0:
+        raise ValueError('diag_list must contain at least one diagnostics dict.')
+    if curve_labels is None:
+        curve_labels = [diag['method_label'] for diag in diag_list]
+    if curve_colors is None:
+        curve_colors = [COLORS[diag['method_label']] for diag in diag_list]
+    if curve_linestyles is None:
+        curve_linestyles = ['-', '--', '-.', ':']
+    if not (len(curve_labels) == len(diag_list) == len(curve_colors)):
+        raise ValueError('curve_labels/curve_colors must match diag_list length.')
+
+    fig, ax = plt.subplots(1, 1, figsize=figsize)
+    for i, diag in enumerate(diag_list):
+        positions = np.asarray(diag['right_noise_levels'], dtype=float)
+        all_errors = np.asarray(diag['all_errors_displayed'], dtype=float)
+        medians = np.asarray(diag['median_displayed'], dtype=float)
+        color = curve_colors[i]
+        linestyle = curve_linestyles[i % len(curve_linestyles)]
+
+        if show_boxes:
+            if len(positions) == 1:
+                widths = [0.18 * positions[0]] if right_xscale == 'log' else [max(0.18 * positions[0], 1e-6)]
+            elif right_xscale == 'log':
+                widths = 0.14 * positions
+            else:
+                diffs = np.diff(np.sort(positions))
+                widths = [0.28 * float(np.min(diffs))] * len(positions)
+
+            bp = ax.boxplot(
+                [all_errors[j] for j in range(len(positions))],
+                positions=positions,
+                widths=widths,
+                manage_ticks=False,
+                patch_artist=True,
+                showfliers=False,
+                medianprops=dict(color=color, linewidth=0.0),
+                whiskerprops=dict(color=color, linewidth=0.8),
+                capprops=dict(color=color, linewidth=0.8),
+                boxprops=dict(color=color, linewidth=0.8),
+            )
+            for patch in bp['boxes']:
+                patch.set_facecolor(color)
+                patch.set_alpha(box_alpha)
+
+        ax.plot(
+            positions, medians,
+            color=color, linewidth=2.3, linestyle=linestyle,
+            marker='o', markersize=4, label=curve_labels[i],
+        )
+
+    ax.set_xscale(right_xscale)
+    all_x = np.concatenate([np.asarray(diag['right_noise_levels'], dtype=float) for diag in diag_list])
+    if right_xscale == 'log':
+        ax.set_xlim(all_x.min() * 0.85, all_x.max() * 1.18)
+    else:
+        uniq = np.unique(np.sort(all_x))
+        if len(uniq) == 1:
+            pad = max(0.35 * uniq[0], 1e-6)
+        else:
+            pad = 0.55 * np.min(np.diff(uniq))
+        ax.set_xlim(max(0.0, all_x.min() - pad), all_x.max() + pad)
+
+    if show_zero_reference:
+        ax.axhline(0.0, color=baseline_color, linewidth=1.1, linestyle=':')
+
+    if right_xticks is not None:
+        ax.set_xticks(right_xticks)
+    if right_xticklabels is not None:
+        ax.set_xticklabels(right_xticklabels)
+
+    ax.set_xlabel(xlabel_noise)
+    ax.set_ylabel(right_ylabel)
+    ax.set_title(title)
+    ax.grid(axis='y', linestyle='--', alpha=0.25)
+    ax.legend(loc=legend_loc)
+    if caption is not None:
+        fig.text(0.5, 0.02, caption, ha='center', va='center', fontsize=11)
+    fig.tight_layout()
+    return fig, ax
+
+
+def _plot_noise_robustness_core(
+    method,
+    idx,
+    val_dataset,
+    device,
+    dx_um,
+    fwhm_center,
+    align_by_fwhm,
+    model=None,
+    forward_spectrum_fft=None,
+    gerchberg_saxton_1d_torch=None,
+    rep_levels=(1e-4, 1e-3, 1e-2),
+    noise_levels=None,
+    right_noise_levels=None,
+    n_trials=50,
+    figsize=(13, 5.2),
+    title_left=None,
+    title_right=None,
+    xlabel_profile='z (μm)',
+    xlabel_noise='Noise level',
+    left_ylabel='Normalized charge',
+    right_ylabel='Peak-weighted relative error to zero-noise output',
+    baseline_label='0 noise',
+    rep_labels=None,
+    legend_loc='upper right',
+    caption=None,
+    gs_seed_fixed=0,
+    gs_iters=2000,
+    use_support=True,
+    support_width_um=30.0,
+    enforce_monotone_display=False,
+    box_facecolor=None,
+    median_color='black',
+    baseline_color='black',
+    rep_colors=None,
+    rep_linestyles=None,
+    right_xscale='log',
+    right_xticks=None,
+    right_xticklabels=None,
+):
+    setup_prab_style()
+    diag = _compute_noise_robustness_diagnostics(
+        method=method, idx=idx, val_dataset=val_dataset, device=device, dx_um=dx_um,
+        fwhm_center=fwhm_center, align_by_fwhm=align_by_fwhm, model=model,
+        forward_spectrum_fft=forward_spectrum_fft, gerchberg_saxton_1d_torch=gerchberg_saxton_1d_torch,
+        rep_levels=rep_levels, noise_levels=noise_levels, right_noise_levels=right_noise_levels,
+        n_trials=n_trials, gs_seed_fixed=gs_seed_fixed, gs_iters=gs_iters,
+        use_support=use_support, support_width_um=support_width_um,
+        enforce_monotone_display=enforce_monotone_display,
+    )
+    if box_facecolor is None:
+        box_facecolor = COLORS[diag['method_label']]
+    rep_profiles = diag['rep_profiles']
+    if rep_labels is None:
+        rep_labels = [f'{nl*100:.2f}% noise' for nl, _ in rep_profiles]
+    if rep_colors is None:
+        rep_colors = ['#1f77b4', '#e67e22', '#d62728']
+    if rep_linestyles is None:
+        rep_linestyles = ['--', '-.', ':']
+
+    fig, (ax_left, ax_right) = plt.subplots(1, 2, figsize=figsize)
+    fig.subplots_adjust(bottom=0.18, wspace=0.28)
+
+    ax_left.plot(diag['z_um'], diag['baseline_profile'], color=baseline_color, linestyle='-', linewidth=2.2, label=baseline_label)
+    for i, ((_, prof), label) in enumerate(zip(rep_profiles, rep_labels)):
+        ax_left.plot(diag['z_um'], prof, color=rep_colors[i % len(rep_colors)], linestyle=rep_linestyles[i % len(rep_linestyles)], linewidth=2.0, label=label)
+    ax_left.set_xlabel(xlabel_profile)
+    ax_left.set_ylabel(left_ylabel)
+    ax_left.set_title(title_left or '')
+    ax_left.grid(alpha=0.25)
+    ax_left.legend(loc=legend_loc)
+
+    positions = np.asarray(diag['right_noise_levels'], dtype=float)
+    all_errors = np.asarray(diag['all_errors_displayed'], dtype=float)
+    medians = np.asarray(diag['median_displayed'], dtype=float)
+
+    if len(positions) == 1:
+        widths = [0.25 * positions[0]] if right_xscale == 'log' else [max(0.25 * positions[0], 1e-6)]
+    elif right_xscale == 'log':
+        widths = 0.22 * positions
+    else:
+        diffs = np.diff(np.sort(positions))
+        widths = [0.45 * float(np.min(diffs))] * len(positions)
+
+    bp = ax_right.boxplot(
+        [all_errors[i] for i in range(len(positions))],
+        positions=positions,
+        widths=widths,
+        manage_ticks=False,
+        patch_artist=True,
+        showfliers=False,
+        medianprops=dict(color=median_color, linewidth=2),
+        whiskerprops=dict(color=box_facecolor, linewidth=1.4),
+        capprops=dict(color=box_facecolor, linewidth=1.4),
+        boxprops=dict(color=box_facecolor, linewidth=1.4),
+    )
+    for patch in bp['boxes']:
+        patch.set_facecolor(box_facecolor)
+        patch.set_alpha(0.45)
+
+    ax_right.plot(positions, medians, color=median_color, linewidth=2.2, marker='o', markersize=4, label='Median trend')
+    ax_right.axhline(0.0, color=baseline_color, linewidth=1.2, linestyle=':', label='Zero-noise reference')
+    ax_right.set_xscale(right_xscale)
+    if right_xscale == 'log':
+        ax_right.set_xlim(positions.min() * 0.85, positions.max() * 1.18)
+    else:
+        if len(positions) == 1:
+            pad = max(0.35 * positions[0], 1e-6)
+        else:
+            pad = 0.55 * np.min(np.diff(np.sort(positions)))
+        ax_right.set_xlim(max(0.0, positions.min() - pad), positions.max() + pad)
+    if right_xticks is not None:
+        ax_right.set_xticks(right_xticks)
+    if right_xticklabels is not None:
+        ax_right.set_xticklabels(right_xticklabels)
     ax_right.set_xlabel(xlabel_noise)
     ax_right.set_ylabel(right_ylabel)
     ax_right.set_title(title_right or '')
@@ -1277,21 +1574,137 @@ def _plot_noise_robustness_core(
     if caption is not None:
         fig.text(0.5, 0.04, caption, ha='center', va='center', fontsize=11)
 
-    diagnostics = {
-        'idx': int(idx),
-        'method': method,
-        'z_um': z,
-        'target': tgt_norm,
-        'baseline_profile': base_aligned,
-        'rep_profiles': rep_profiles,
-        'noise_levels_all': noise_levels_all,
-        'all_errors_displayed': all_errors,
-        'all_errors_raw': raw_errors,
-        'median_displayed': medians,
-        'enforce_monotone_display': bool(enforce_monotone_display),
-    }
-    fig._qep_noise_robustness = diagnostics
+    fig._qep_noise_robustness = diag
     return fig, (ax_left, ax_right)
+
+
+def get_noise_robustness_nn_diagnostics(
+    model,
+    val_dataset,
+    idx,
+    device,
+    dx_um,
+    fwhm_center,
+    align_by_fwhm,
+    rep_levels=(1e-4, 1e-3, 1e-2),
+    noise_levels=None,
+    right_noise_levels=None,
+    n_trials=50,
+    enforce_monotone_display=False,
+):
+    return _compute_noise_robustness_diagnostics(
+        method='nn', idx=idx, val_dataset=val_dataset, device=device, dx_um=dx_um,
+        fwhm_center=fwhm_center, align_by_fwhm=align_by_fwhm, model=model,
+        rep_levels=rep_levels, noise_levels=noise_levels, right_noise_levels=right_noise_levels,
+        n_trials=n_trials, enforce_monotone_display=enforce_monotone_display,
+    )
+
+
+def get_noise_robustness_gs_diagnostics(
+    val_dataset,
+    idx,
+    device,
+    dx_um,
+    fwhm_center,
+    align_by_fwhm,
+    forward_spectrum_fft,
+    gerchberg_saxton_1d_torch,
+    rep_levels=(1e-4, 1e-3, 1e-2),
+    noise_levels=None,
+    right_noise_levels=None,
+    n_trials=50,
+    gs_seed_fixed=0,
+    gs_iters=2000,
+    use_support=True,
+    support_width_um=30.0,
+    enforce_monotone_display=False,
+):
+    return _compute_noise_robustness_diagnostics(
+        method='gs', idx=idx, val_dataset=val_dataset, device=device, dx_um=dx_um,
+        fwhm_center=fwhm_center, align_by_fwhm=align_by_fwhm,
+        forward_spectrum_fft=forward_spectrum_fft, gerchberg_saxton_1d_torch=gerchberg_saxton_1d_torch,
+        rep_levels=rep_levels, noise_levels=noise_levels, right_noise_levels=right_noise_levels,
+        n_trials=n_trials, gs_seed_fixed=gs_seed_fixed, gs_iters=gs_iters,
+        use_support=use_support, support_width_um=support_width_um,
+        enforce_monotone_display=enforce_monotone_display,
+    )
+
+
+def plot_noise_robustness_left_from_diagnostics(
+    diag,
+    figsize=(6.4, 5.0),
+    title=None,
+    xlabel_profile='z (μm)',
+    left_ylabel='Normalized charge',
+    baseline_label='0 noise',
+    rep_labels=None,
+    legend_loc='upper right',
+    baseline_color='black',
+    rep_colors=None,
+    rep_linestyles=None,
+    caption=None,
+):
+    return _plot_noise_robustness_left_from_diag(
+        diag=diag, figsize=figsize, title=title, xlabel_profile=xlabel_profile,
+        left_ylabel=left_ylabel, baseline_label=baseline_label, rep_labels=rep_labels,
+        legend_loc=legend_loc, baseline_color=baseline_color, rep_colors=rep_colors,
+        rep_linestyles=rep_linestyles, caption=caption,
+    )
+
+
+def plot_noise_robustness_right_from_diagnostics(
+    diag,
+    figsize=(6.8, 5.0),
+    title=None,
+    xlabel_noise='Noise level',
+    right_ylabel='Peak-weighted relative error to zero-noise output',
+    legend_loc='upper right',
+    caption=None,
+    box_facecolor=None,
+    median_color='black',
+    baseline_color='black',
+    right_xscale='log',
+    right_xticks=None,
+    right_xticklabels=None,
+    curve_label='Median trend',
+    zero_ref_label='Zero-noise reference',
+):
+    return _plot_noise_robustness_right_from_diag(
+        diag=diag, figsize=figsize, title=title, xlabel_noise=xlabel_noise,
+        right_ylabel=right_ylabel, legend_loc=legend_loc, caption=caption,
+        box_facecolor=box_facecolor, median_color=median_color, baseline_color=baseline_color,
+        right_xscale=right_xscale, right_xticks=right_xticks, right_xticklabels=right_xticklabels,
+        curve_label=curve_label, zero_ref_label=zero_ref_label,
+    )
+
+
+def plot_noise_robustness_comparison(
+    diag_list,
+    figsize=(7.4, 5.0),
+    title='Noise robustness comparison',
+    xlabel_noise='Noise level',
+    right_ylabel='Peak-weighted relative error to zero-noise output',
+    legend_loc='upper left',
+    caption=None,
+    right_xscale='log',
+    right_xticks=None,
+    right_xticklabels=None,
+    curve_labels=None,
+    curve_colors=None,
+    curve_linestyles=None,
+    show_boxes=True,
+    box_alpha=0.16,
+    show_zero_reference=True,
+    baseline_color='black',
+):
+    return _plot_noise_robustness_combined_right(
+        diag_list=diag_list, figsize=figsize, title=title, xlabel_noise=xlabel_noise,
+        right_ylabel=right_ylabel, legend_loc=legend_loc, caption=caption,
+        right_xscale=right_xscale, right_xticks=right_xticks, right_xticklabels=right_xticklabels,
+        curve_labels=curve_labels, curve_colors=curve_colors, curve_linestyles=curve_linestyles,
+        show_boxes=show_boxes, box_alpha=box_alpha, show_zero_reference=show_zero_reference,
+        baseline_color=baseline_color,
+    )
 
 
 def plot_noise_robustness_nn(
@@ -1304,6 +1717,7 @@ def plot_noise_robustness_nn(
     align_by_fwhm,
     rep_levels=(1e-4, 1e-3, 1e-2),
     noise_levels=None,
+    right_noise_levels=None,
     n_trials=50,
     figsize=(13, 5.2),
     title_left='1D dilated ResNet reconstruction under spectral noise',
@@ -1317,32 +1731,24 @@ def plot_noise_robustness_nn(
     legend_loc='upper right',
     caption=None,
     enforce_monotone_display=False,
+    baseline_color='black',
+    rep_colors=None,
+    rep_linestyles=None,
+    right_xscale='log',
+    right_xticks=None,
+    right_xticklabels=None,
 ):
     return _plot_noise_robustness_core(
-        method='nn',
-        idx=idx,
-        val_dataset=val_dataset,
-        device=device,
-        dx_um=dx_um,
-        fwhm_center=fwhm_center,
-        align_by_fwhm=align_by_fwhm,
-        model=model,
-        rep_levels=rep_levels,
-        noise_levels=noise_levels,
-        n_trials=n_trials,
-        figsize=figsize,
-        title_left=title_left,
-        title_right=title_right,
-        xlabel_profile=xlabel_profile,
-        xlabel_noise=xlabel_noise,
-        left_ylabel=left_ylabel,
-        right_ylabel=right_ylabel,
-        baseline_label=baseline_label,
-        rep_labels=rep_labels,
-        legend_loc=legend_loc,
-        caption=caption,
-        enforce_monotone_display=enforce_monotone_display,
-        box_facecolor=COLORS[METHOD_NN],
+        method='nn', idx=idx, val_dataset=val_dataset, device=device, dx_um=dx_um,
+        fwhm_center=fwhm_center, align_by_fwhm=align_by_fwhm, model=model,
+        rep_levels=rep_levels, noise_levels=noise_levels, right_noise_levels=right_noise_levels,
+        n_trials=n_trials, figsize=figsize, title_left=title_left, title_right=title_right,
+        xlabel_profile=xlabel_profile, xlabel_noise=xlabel_noise, left_ylabel=left_ylabel,
+        right_ylabel=right_ylabel, baseline_label=baseline_label, rep_labels=rep_labels,
+        legend_loc=legend_loc, caption=caption, enforce_monotone_display=enforce_monotone_display,
+        box_facecolor=COLORS[METHOD_NN], baseline_color=baseline_color,
+        rep_colors=rep_colors, rep_linestyles=rep_linestyles, right_xscale=right_xscale,
+        right_xticks=right_xticks, right_xticklabels=right_xticklabels,
     )
 
 
@@ -1357,6 +1763,7 @@ def plot_noise_robustness_gs(
     gerchberg_saxton_1d_torch,
     rep_levels=(1e-4, 1e-3, 1e-2),
     noise_levels=None,
+    right_noise_levels=None,
     n_trials=50,
     figsize=(13, 5.2),
     title_left='GS reconstruction under spectral noise',
@@ -1374,39 +1781,27 @@ def plot_noise_robustness_gs(
     use_support=True,
     support_width_um=30.0,
     enforce_monotone_display=False,
+    baseline_color='black',
+    rep_colors=None,
+    rep_linestyles=None,
+    right_xscale='log',
+    right_xticks=None,
+    right_xticklabels=None,
 ):
     return _plot_noise_robustness_core(
-        method='gs',
-        idx=idx,
-        val_dataset=val_dataset,
-        device=device,
-        dx_um=dx_um,
-        fwhm_center=fwhm_center,
-        align_by_fwhm=align_by_fwhm,
-        forward_spectrum_fft=forward_spectrum_fft,
-        gerchberg_saxton_1d_torch=gerchberg_saxton_1d_torch,
-        rep_levels=rep_levels,
-        noise_levels=noise_levels,
-        n_trials=n_trials,
-        figsize=figsize,
-        title_left=title_left,
-        title_right=title_right,
-        xlabel_profile=xlabel_profile,
-        xlabel_noise=xlabel_noise,
-        left_ylabel=left_ylabel,
-        right_ylabel=right_ylabel,
-        baseline_label=baseline_label,
-        rep_labels=rep_labels,
-        legend_loc=legend_loc,
-        caption=caption,
-        gs_seed_fixed=gs_seed_fixed,
-        gs_iters=gs_iters,
-        use_support=use_support,
-        support_width_um=support_width_um,
-        enforce_monotone_display=enforce_monotone_display,
-        box_facecolor=COLORS[METHOD_GS],
+        method='gs', idx=idx, val_dataset=val_dataset, device=device, dx_um=dx_um,
+        fwhm_center=fwhm_center, align_by_fwhm=align_by_fwhm,
+        forward_spectrum_fft=forward_spectrum_fft, gerchberg_saxton_1d_torch=gerchberg_saxton_1d_torch,
+        rep_levels=rep_levels, noise_levels=noise_levels, right_noise_levels=right_noise_levels,
+        n_trials=n_trials, figsize=figsize, title_left=title_left, title_right=title_right,
+        xlabel_profile=xlabel_profile, xlabel_noise=xlabel_noise, left_ylabel=left_ylabel,
+        right_ylabel=right_ylabel, baseline_label=baseline_label, rep_labels=rep_labels,
+        legend_loc=legend_loc, caption=caption, gs_seed_fixed=gs_seed_fixed, gs_iters=gs_iters,
+        use_support=use_support, support_width_um=support_width_um,
+        enforce_monotone_display=enforce_monotone_display, box_facecolor=COLORS[METHOD_GS],
+        baseline_color=baseline_color, rep_colors=rep_colors, rep_linestyles=rep_linestyles,
+        right_xscale=right_xscale, right_xticks=right_xticks, right_xticklabels=right_xticklabels,
     )
-
 
 def print_cache_summary(cache):
     print("Selected validation samples")
